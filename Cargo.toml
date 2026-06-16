@@ -1,0 +1,28 @@
+[package]
+name = "kete"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Encrypted keyed storage: per-key ChaCha20-Poly1305 over a manifestus vault, addressed and keyed by tohu device identity. The shared storage adapter for the passless app stack (photon, idiosync, ...)."
+authors = ["Nick Spiker <fractaldecoder@proton.me>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nickspiker/kete"
+readme = "README.md"
+keywords = ["storage", "encryption", "vault", "keyed-store", "manifestus"]
+categories = ["cryptography", "filesystem", "database-implementations"]
+
+[dependencies]
+# Storage engine + device identity. `version` is required for crates.io publishing
+# (it uses the registry version; the path is for local development) — keep these in
+# step with the published manifestus/tohu versions.
+manifestus = { version = "0.0.0", path = "../manifestus" }
+tohu = { version = "0.0.0", path = "../tohu" }
+
+# Crypto — versions matched to photon so a shared dep graph unifies cleanly.
+blake3 = "1.5"
+chacha20poly1305 = "0.11.0-rc.2"
+rand = "0.8"
+
+# Platform dirs + logging facade (replaces photon's internal crate::log).
+dirs = "6.0.0"
+log = "0.4"
