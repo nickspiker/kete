@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["storage", "encryption", "vault", "keyed-store", "manifestus"]
 categories = ["cryptography", "filesystem", "database-implementations"]
 
+# Decrypting vault inspector — manifestus's `vaultinfo` shows ciphertext sizes; this decrypts logical keys.
+[[bin]]
+name = "keteinfo"
+path = "src/bin/keteinfo.rs"
+
 [dependencies]
 # Storage engine + device identity. `version` is required for crates.io publishing
 # (it uses the registry version; the path is for local development) — keep these in
