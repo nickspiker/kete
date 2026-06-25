@@ -108,8 +108,8 @@ pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
 pub struct FlatStorage {
     /// `App::id` — feeds `vault_path_name` and the per-key KDF context strings.
     app_id: String,
-    /// Frozen v0 handle_seed (`tohu::handle_seed(handle)`). The vault's name/address seed and one input to each per-key encryption key.
-    handle_seed: [u8; 32],
+    /// The vault seed (identity_seed). One input to per-key encryption keys and the vault filename.
+    vault_seed: [u8; 32],
     /// The 32-byte secret the vault is bound to — mixed into both the vault filename and every per-key encryption key. `tohu::device::device_secret()` locks the vault to this machine; any portable secret (passphrase-derived, identity key) makes a vault that opens on any machine holding that secret.
     secret: [u8; 32],
     /// The manifestus engine. Mutex so future multi-threaded callers Just Work.
@@ -121,23 +121,13 @@ pub struct FlatStorage {
 }
 
 impl FlatStorage {
-    /// Open an encrypted vault (per-key ChaCha20-Poly1305), keyed on `secret`. `secret` is mixed into both the filename and every value's key, so the same `(app, handle, secret)` reproduces the same vault and decryption anywhere. Pass `tohu::device::device_secret()` to lock the vault to this machine; pass a portable secret (passphrase-derived, identity key) for a vault you can move to or open on another machine.
-    pub fn new(app: App, handle: &str, secret: [u8; 32]) -> Result<Self, StorageError> {
-        Self::open(app, tohu::handle_seed(handle), secret, true)
-    }
-
-    /// Like [`new`](Self::new) but takes the already-derived vault seed (`tohu::handle_seed`) directly, so a caller that has the seed (e.g. a resumed session) opens the vault without the handle string.
-    pub fn new_with_seed(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
+    /// Open an encrypted vault (per-key ChaCha20-Poly1305), keyed on `secret`. `secret` is mixed into both the filename and every value's key, so the same `(app, seed, secret)` reproduces the same vault and decryption anywhere. Pass `tohu::device::device_secret()` to lock the vault to this machine; pass a portable secret (passphrase-derived, identity key) for a vault you can move to or open on another machine.
+    pub fn new(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
         Self::open(app, vault_seed, secret, true)
     }
 
     /// Open a vault that stores values in **plaintext** — same addressing, durability, and integrity (manifestus still BLAKE3-seals every block), but no per-key encryption, so values stay inspectable on disk. Use for data that isn't secret; do NOT use for secrets (a plaintext vault file is readable by anyone who can read it). `secret` still scopes the vault path (machine-bound or portable, your choice).
-    pub fn new_plaintext(app: App, handle: &str, secret: [u8; 32]) -> Result<Self, StorageError> {
-        Self::open(app, tohu::handle_seed(handle), secret, false)
-    }
-
-    /// Plaintext variant of [`new_with_seed`](Self::new_with_seed).
-    pub fn new_plaintext_with_seed(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
+    pub fn new_plaintext(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
         Self::open(app, vault_seed, secret, false)
     }
 
@@ -168,7 +158,7 @@ impl FlatStorage {
         let vault = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, unix_now())?;
         Ok(Self {
             app_id: app.id.to_string(),
-            handle_seed: vault_seed,
+            vault_seed,
             secret,
             vault: Mutex::new(vault),
             healed_at_open,
@@ -229,11 +219,11 @@ impl FlatStorage {
 
     // ======================================================================== Internal key derivation ================================================
 
-    /// Per-key AEAD key: domain-separated by app, bound to the handle + the vault `secret`. For `app_id == "photon"` with `secret = device_secret`, this is byte-identical to photon's original `derive_key("photon.storage.encryption.v0", key ++ handle_seed ++ device_secret)`.
+    /// Per-key AEAD key: domain-separated by app, bound to the vault seed + the vault `secret`.
     fn derive_enc_key(&self, key: &str) -> [u8; 32] {
         let context = [
             key.as_bytes(),
-            self.handle_seed.as_slice(),
+            self.vault_seed.as_slice(),
             self.secret.as_slice(),
         ]
         .concat();
@@ -261,7 +251,7 @@ pub fn set_android_vault_dirs(primary: String, shadow: String) {
 }
 
 /// Resolve the two ring paths for the given per-handle filename. Files live under `<config_dir>/<dir>/<filename>.vsf` and `<data_dir>/<dir>/<filename>.vsf`. On Linux + Windows the XDG split gives different directories. On macOS `config_dir()` and `data_dir()` collide; the shadow then shares the directory with `<filename>.shadow.vsf`. On Android the dirs come from the JNI shim.
-/// The two physical ring-file paths a vault occupies (config-dir + data-dir, or the shadow-suffixed pair when they coincide), for a given app + vault seed + secret. Exposed so inspection tools (`keteinfo`) can open the same files `FlatStorage` would, without re-deriving the (android-vs-desktop, config-vs-data) path logic. Same inputs as [`FlatStorage::new_with_seed`].
+/// The two physical ring-file paths a vault occupies (config-dir + data-dir, or the shadow-suffixed pair when they coincide), for a given app + vault seed + secret. Exposed so inspection tools (`keteinfo`) can open the same files `FlatStorage` would, without re-deriving the (android-vs-desktop, config-vs-data) path logic. Same inputs as [`FlatStorage::new`].
 pub fn vault_ring_paths(app: App, vault_seed: &[u8; 32], secret: &[u8; 32]) -> Result<[PathBuf; 2], StorageError> {
     let filename = tohu::vault_path_name(app.id, vault_seed, secret);
     vault_paths(app.dir, &filename)
