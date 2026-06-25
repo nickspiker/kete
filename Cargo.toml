@@ -1,6 +1,6 @@
 [package]
 name = "kete"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Encrypted keyed storage: per-key ChaCha20-Poly1305 over a manifestus vault, addressed and keyed by tohu device identity. The shared storage adapter for the passless app stack (photon, idiosync, ...)."
@@ -21,7 +21,7 @@ path = "src/bin/keteinfo.rs"
 # (it uses the registry version; the path is for local development) — keep these in
 # step with the published manifestus/tohu versions.
 manifestus = { version = "0.0.0", path = "../manifestus" }
-tohu = { version = "0.0.0", path = "../tohu" }
+tohu = { version = "0.0.1", path = "../tohu" }
 
 # Crypto — versions matched to photon so a shared dep graph unifies cleanly.
 blake3 = "1.5"

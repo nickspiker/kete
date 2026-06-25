@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn vault_round_trip() {
-        let store = FlatStorage::new(APP, "kete-smoke", [3u8; 32]).unwrap();
+        let store = FlatStorage::new(APP, tohu::handle_seed("kete-smoke"), [3u8; 32]).unwrap();
         assert!(store.read("k").unwrap().is_none());
         store.write("k", b"value").unwrap();
         assert_eq!(store.read("k").unwrap().as_deref(), Some(&b"value"[..]));
@@ -353,15 +353,15 @@ mod tests {
     #[test]
     fn secret_separates_vaults() {
         // Same app + handle, different device secret → a different vault file, so one device's data is invisible to the other.
-        let a = FlatStorage::new(APP, "kete-devbind", [1u8; 32]).unwrap();
+        let a = FlatStorage::new(APP, tohu::handle_seed("kete-devbind"), [1u8; 32]).unwrap();
         a.write("secret", b"hunter2").unwrap();
-        let b = FlatStorage::new(APP, "kete-devbind", [2u8; 32]).unwrap();
+        let b = FlatStorage::new(APP, tohu::handle_seed("kete-devbind"), [2u8; 32]).unwrap();
         assert!(b.read("secret").unwrap().is_none());
     }
 
     #[test]
     fn plaintext_round_trip() {
-        let store = FlatStorage::new_plaintext(APP, "kete-plain", [4u8; 32]).unwrap();
+        let store = FlatStorage::new_plaintext(APP, tohu::handle_seed("kete-plain"), [4u8; 32]).unwrap();
         store.write("k", b"in the clear").unwrap();
         assert_eq!(store.read("k").unwrap().as_deref(), Some(&b"in the clear"[..]));
         store.delete("k").unwrap();
