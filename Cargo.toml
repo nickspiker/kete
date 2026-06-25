@@ -20,7 +20,7 @@ path = "src/bin/keteinfo.rs"
 # Storage engine + device identity. `version` is required for crates.io publishing
 # (it uses the registry version; the path is for local development) — keep these in
 # step with the published manifestus/tohu versions.
-manifestus = { version = "0.0.0", path = "../manifestus" }
+manifestus = { version = "0.0.1", path = "../manifestus" }
 tohu = { version = "0.0.1", path = "../tohu" }
 
 # Crypto — versions matched to photon so a shared dep graph unifies cleanly.
