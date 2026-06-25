@@ -103,7 +103,7 @@ fn main() -> ExitCode {
         println!("(no logical keys given — structure shown above; pass keys to decrypt values)");
         return ExitCode::from(0);
     }
-    let storage = match FlatStorage::new_with_seed(app, seed, secret) {
+    let storage = match FlatStorage::new(app, seed, secret) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("keteinfo: opening vault: {e}");
