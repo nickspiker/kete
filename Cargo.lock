@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -528,7 +528,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "libc",
- "vsf",
+ "vsf 0.8.0",
 ]
 
 [[package]]
@@ -829,12 +829,12 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tohu"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
  "jni",
- "unicode-normalization",
+ "vsf 0.6.42",
 ]
 
 [[package]]
@@ -872,6 +872,23 @@ checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
 dependencies = [
  "crypto-common",
  "ctutils",
+]
+
+[[package]]
+name = "vsf"
+version = "0.6.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c5d0a40ee257e3d1c771570668208f2daa233eab0c91badf84d00132b0218bb"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "chrono",
+ "hex",
+ "i256",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "unicode-normalization",
 ]
 
 [[package]]
