@@ -191,7 +191,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("  --app ID      the app namespace (e.g. \"photon\")");
     eprintln!("  --dir DIR     the XDG subdir the rings live under");
-    eprintln!("  --seed HEX    vault_seed (tohu::handle_seed), 64 hex chars");
+    eprintln!("  --seed HEX    vault_seed (identity_seed), 64 hex chars");
     eprintln!("  --secret HEX  the secret (device_secret or portable), 64 hex chars");
     eprintln!("  KEY...        LOGICAL string keys the app wrote (NOT the on-disk hash — that's one-way)");
     eprintln!();
