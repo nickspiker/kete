@@ -166,49 +166,66 @@ impl FlatStorage {
         })
     }
 
-    /// Write data under a logical key. Encrypts with the per-key ChaCha20-Poly1305 key; durable on return (a spine generation references the new state on at least one verified mirror).
+    /// Write data under a logical **string** key. Hashes the key to a 32-byte vault address (so the string never reaches disk), then delegates to [`write_addr`](Self::write_addr). For callers whose key is genuinely a string (table/pk/seq, e.g. rārangi). Callers that already hold a 32-byte address (a seed, a conversation id) should use [`write_addr`](Self::write_addr) directly rather than text-encoding it first.
     pub fn write(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.write_addr(&self.derive_entry_key(key), data)
+    }
+
+    /// Read the value for a logical **string** key. See [`write`](Self::write) for when to use this vs. [`read_addr`](Self::read_addr).
+    pub fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.read_addr(&self.derive_entry_key(key))
+    }
+
+    /// Remove a logical **string** key. See [`write`](Self::write) for when to use this vs. [`delete_addr`](Self::delete_addr).
+    pub fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.delete_addr(&self.derive_entry_key(key))
+    }
+
+    /// Write data at a caller-supplied 32-byte vault **address**. For callers who already hold the address as bytes (an identity seed, a conversation id) — no text-encoding round-trip. Encrypts with the per-address ChaCha20-Poly1305 key; durable on return (a spine generation references the new state on at least one verified mirror). The address is the AEAD key input, so a value written here reads back identically whether reached via this method or via [`write`](Self::write) with a string that hashes to the same address.
+    pub fn write_addr(&self, addr: &[u8; 32], data: &[u8]) -> Result<(), StorageError> {
         let stored = if self.encrypt {
-            encrypt_bytes(data, &self.derive_enc_key(key)).map_err(StorageError::Crypto)?
+            encrypt_bytes(data, &self.derive_enc_key_for_addr(addr)).map_err(StorageError::Crypto)?
         } else {
             data.to_vec()
         };
-        let entry_key = self.derive_entry_key(key);
-
         let mut vault = self
             .vault
             .lock()
             .map_err(|_| StorageError::Vault("FlatStorage mutex poisoned".to_string()))?;
-        vault.put(&entry_key, &stored, unix_now())?;
+        vault.put(addr, &stored, unix_now())?;
         Ok(())
     }
 
-    /// Read the value for a logical key. Returns `None` if absent. Every block on the path is hash-verified by manifestus.
-    pub fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        let entry_key = self.derive_entry_key(key);
+    /// Read the value at a 32-byte vault **address**. Returns `None` if absent. Every block on the path is hash-verified by manifestus.
+    pub fn read_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         let mut vault = self
             .vault
             .lock()
             .map_err(|_| StorageError::Vault("FlatStorage mutex poisoned".to_string()))?;
-        let Some(stored) = vault.get(&entry_key)? else {
+        let Some(stored) = vault.get(addr)? else {
             return Ok(None);
         };
         if !self.encrypt {
             return Ok(Some(stored));
         }
-        let plaintext = decrypt_bytes(&stored, &self.derive_enc_key(key)).map_err(StorageError::Crypto)?;
+        let plaintext =
+            decrypt_bytes(&stored, &self.derive_enc_key_for_addr(addr)).map_err(StorageError::Crypto)?;
         Ok(Some(plaintext))
     }
 
-    /// Remove a logical key. Blocks zeroed on both mirrors immediately; the plow reaps the slots.
-    pub fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let entry_key = self.derive_entry_key(key);
+    /// Remove the value at a 32-byte vault **address**. Blocks zeroed on both mirrors immediately; the plow reaps the slots.
+    pub fn delete_addr(&self, addr: &[u8; 32]) -> Result<(), StorageError> {
         let mut vault = self
             .vault
             .lock()
             .map_err(|_| StorageError::Vault("FlatStorage mutex poisoned".to_string()))?;
-        vault.delete(&entry_key, unix_now())?;
+        vault.delete(addr, unix_now())?;
         Ok(())
+    }
+
+    /// This vault's seed — the identity the vault is for. Callers use it as the `scope` for self/global entries (the vault's own contact index, settings, our own avatar), since a self-scoped entry belongs to *this* vault and the seed is already held here.
+    pub fn vault_seed(&self) -> &[u8; 32] {
+        &self.vault_seed
     }
 
     /// True if the mirrors diverged at open (and were healed) or a mirror died mid-session.
@@ -219,10 +236,10 @@ impl FlatStorage {
 
     // ======================================================================== Internal key derivation ================================================
 
-    /// Per-key AEAD key: domain-separated by app, bound to the vault seed + the vault `secret`.
-    fn derive_enc_key(&self, key: &str) -> [u8; 32] {
+    /// Per-address AEAD key: domain-separated by app, bound to the vault entry address + the vault seed + the vault `secret`. Keyed on the 32-byte address rather than any logical string, so the string and byte-addressed APIs that resolve to the same address produce the same AEAD key.
+    fn derive_enc_key_for_addr(&self, addr: &[u8; 32]) -> [u8; 32] {
         let context = [
-            key.as_bytes(),
+            addr.as_slice(),
             self.vault_seed.as_slice(),
             self.secret.as_slice(),
         ]
@@ -230,7 +247,7 @@ impl FlatStorage {
         blake3::derive_key(&format!("{}.storage.encryption.v0", self.app_id), &context)
     }
 
-    /// Fixed 32-byte vault entry address for a logical key. The vault file is already per-(app, handle, device), so no identity material is mixed here — only the app domain + the key.
+    /// Fixed 32-byte vault entry address for a logical string key. The vault file is already per-(app, handle, device), so no identity material is mixed here — only the app domain + the key.
     fn derive_entry_key(&self, key: &str) -> [u8; 32] {
         blake3::derive_key(&format!("{}.storage.entry.v0", self.app_id), key.as_bytes())
     }
