@@ -267,6 +267,12 @@ pub fn set_android_vault_dirs(primary: String, shadow: String) {
     }
 }
 
+/// The injected Android `(primary, shadow)` vault directories, if set. Exposed so a device-clean can wipe the ACTUAL vault dirs on Android — `dirs::config_dir()` doesn't resolve there, so a wipe that walked it would silently no-op.
+#[cfg(target_os = "android")]
+pub fn android_vault_dirs() -> Option<(String, String)> {
+    ANDROID_VAULT_DIRS.lock().ok().and_then(|g| g.clone())
+}
+
 /// Resolve the two ring paths for the given per-handle filename. Files live under `<config_dir>/<dir>/<filename>.vsf` and `<data_dir>/<dir>/<filename>.vsf`. On Linux + Windows the XDG split gives different directories. On macOS `config_dir()` and `data_dir()` collide; the shadow then shares the directory with `<filename>.shadow.vsf`. On Android the dirs come from the JNI shim.
 /// The two physical ring-file paths a vault occupies (config-dir + data-dir, or the shadow-suffixed pair when they coincide), for a given app + vault seed + secret. Exposed so inspection tools (`keteinfo`) can open the same files `FlatStorage` would, without re-deriving the (android-vs-desktop, config-vs-data) path logic. Same inputs as [`FlatStorage::new`].
 pub fn vault_ring_paths(app: App, vault_seed: &[u8; 32], secret: &[u8; 32]) -> Result<[PathBuf; 2], StorageError> {
