@@ -9,7 +9,7 @@
 //! Crash model (inherited from manifestus): power loss at ANY byte boundary is normal operation. Every block self-validates; the committed generation defines exactly which writes exist; the rollback fence keeps the last 4 generations restorable. Open replicates divergent mirrors block-level (verified, never a file copy) before composing them.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -129,6 +129,31 @@ impl FlatStorage {
     /// Open a vault that stores values in **plaintext** — same addressing, durability, and integrity (manifestus still BLAKE3-seals every block), but no per-key encryption, so values stay inspectable on disk. Use for data that isn't secret; do NOT use for secrets (a plaintext vault file is readable by anyone who can read it). `secret` still scopes the vault path (machine-bound or portable, your choice).
     pub fn new_plaintext(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
         Self::open(app, vault_seed, secret, false)
+    }
+
+    /// Open the vault as the ONE process-wide shared engine for its file — every `open_shared` of the same `(app, seed, secret)` returns the same `Arc<FlatStorage>`, so all threads serialize on one engine and one in-RAM state.
+    ///
+    /// This is the constructor apps must use for any vault reachable from more than one call site: two `new()` engines on the same file are two independent in-RAM states racing the same mirrors — engine A commits, engine B (stale) reads blocks A rewrote → "seal verification failed" mid-session, and B's next commit writes its stale state to BOTH mirrors (read-back-verify checks disk==RAM, not that RAM was right), corrupting the vault at rest. This is exactly how photon's resume-engine + attest-worker-engine pair destroyed a live vault (2026-07-12).
+    ///
+    /// The registry holds `Weak` refs: a vault fully dropped by every holder closes normally and a later `open_shared` reopens it fresh.
+    pub fn open_shared(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Arc<Self>, StorageError> {
+        static OPEN_VAULTS: Mutex<Vec<(String, Weak<FlatStorage>)>> = Mutex::new(Vec::new());
+
+        let filename = tohu::vault_path_name(app.id, &vault_seed, &secret);
+        let mut reg = OPEN_VAULTS
+            .lock()
+            .map_err(|e| StorageError::Io(std::io::Error::other(format!("vault registry lock: {}", e))))?;
+        // Drop dead entries, then look for a live engine on this file.
+        reg.retain(|(_, w)| w.strong_count() > 0);
+        if let Some((_, w)) = reg.iter().find(|(f, _)| *f == filename) {
+            if let Some(live) = w.upgrade() {
+                return Ok(live);
+            }
+        }
+        // Held across the open on purpose: a second thread racing this open must wait and receive the same engine, never construct its own.
+        let vault = Arc::new(Self::open(app, vault_seed, secret, true)?);
+        reg.push((filename, Arc::downgrade(&vault)));
+        Ok(vault)
     }
 
     fn open(app: App, vault_seed: [u8; 32], secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
