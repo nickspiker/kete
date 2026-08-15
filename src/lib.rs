@@ -102,9 +102,77 @@ pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     cipher.decrypt(&nonce, ciphertext).map_err(|e| e.to_string())
 }
 
+// ============================================================================ The librarian ==============================================================
+
+/// One message to the librarian — the vault-owner thread. Every op carries its own reply channel; mutations reply after the write is durable, so the sync wrappers below preserve durable-on-return exactly.
+enum VaultOp {
+    Get {
+        addr: [u8; 32],
+        reply: std::sync::mpsc::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+    Put {
+        addr: [u8; 32],
+        stored: Vec<u8>,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    Delete {
+        addr: [u8; 32],
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    Degraded {
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+}
+
+/// The librarian: the ONE thread that owns the manifestus engine — no mutex exists, so a blocked reader is structurally impossible rather than a per-call-site discipline.
+/// The old shape (engine under a Mutex, every thread calling in) meant an innocent read queued behind whichever persist worker held the lock thru a whole encrypted table write — the 2026-08-15 field lag (400-1794ms UI stalls on a per-tick avatar probe).
+/// Reads go first: before each mutation the mailbox is drained and every queued Get is answered, so a read waits for at most the ONE write already on the platter, never a queue of them. Writes can theoretically starve under a sustained read flood, but read floods are boot-shaped and brief while writes coalesce upstream — the trade is deliberate.
+/// The thread exits when every sender drops (recv errs), dropping the engine; manifestus is crash-safe at any byte boundary, so no explicit flush handshake is needed.
+fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<VaultOp>) {
+    let mut pending: std::collections::VecDeque<VaultOp> = std::collections::VecDeque::new();
+    loop {
+        // Idle: block for one op. Busy: drain whatever queued while the last op ran.
+        if pending.is_empty() {
+            match rx.recv() {
+                Ok(op) => pending.push_back(op),
+                Err(_) => return,
+            }
+        }
+        while let Ok(op) = rx.try_recv() {
+            pending.push_back(op);
+        }
+        // Answer every queued read (their mutual order preserved), then perform ONE mutation and re-drain — a read arriving mid-write jumps every still-queued write.
+        let mut mutation: Option<VaultOp> = None;
+        while let Some(op) = pending.pop_front() {
+            match op {
+                VaultOp::Get { addr, reply } => {
+                    let _ = reply.send(vault.get(&addr).map_err(|e| e.to_string()));
+                }
+                VaultOp::Degraded { reply } => {
+                    let _ = reply.send(vault.degraded());
+                }
+                m => {
+                    mutation = Some(m);
+                    break;
+                }
+            }
+        }
+        match mutation {
+            Some(VaultOp::Put { addr, stored, reply }) => {
+                let _ = reply.send(vault.put(&addr, &stored, unix_now()).map_err(|e| e.to_string()));
+            }
+            Some(VaultOp::Delete { addr, reply }) => {
+                let _ = reply.send(vault.delete(&addr, unix_now()).map(|_| ()).map_err(|e| e.to_string()));
+            }
+            _ => {}
+        }
+    }
+}
+
 // ============================================================================ FlatStorage ================================================================
 
 /// All of an app's vault I/O goes thru this struct. Initialized once with the app namespace + handle + secret; the dual-ring vault is opened (or formatted) during construction. Callers see only logical keys; vault internals + per-key encryption are managed below.
+/// The engine itself lives on the librarian thread (see [`librarian`]); this struct holds the mailbox. The Mutex around the Sender exists only because std's Sender is !Sync — it guards a sub-microsecond `send`, never IO.
 pub struct FlatStorage {
     /// `App::id` — feeds `vault_path_name` and the per-key KDF context strings.
     app_id: String,
@@ -112,12 +180,26 @@ pub struct FlatStorage {
     vault_seed: [u8; 32],
     /// The 32-byte secret the vault is bound to — mixed into both the vault filename and every per-key encryption key. `tohu::device::device_secret()` locks the vault to this machine; any portable secret (passphrase-derived, identity key) makes a vault that opens on any machine holding that secret.
     secret: [u8; 32],
-    /// The manifestus engine. Mutex so future multi-threaded callers Just Work.
-    vault: Mutex<Vault<FileDev, FileDev>>,
+    /// The librarian's mailbox.
+    ops: Mutex<std::sync::mpsc::Sender<VaultOp>>,
     /// Mirrors diverged at open and were replicated back into agreement.
     healed_at_open: bool,
     /// Whether values are encrypted (per-key ChaCha20-Poly1305) before storage. False = plaintext: the vault still gives integrity + durability (manifestus BLAKE3-seals every block), values are just stored as-is and stay inspectable on disk (e.g. `vsfinfo` on a VSF value). The caller's choice — a plaintext vault is not leaked-file-safe.
     encrypt: bool,
+}
+
+impl FlatStorage {
+    /// Post one op to the librarian and wait for its reply — the shared shape of every sync wrapper. A dead librarian (all-senders-dropped teardown racing a call, or a panicked thread) surfaces as a Vault error, the same failure class the old poisoned mutex produced, minus the poisoning.
+    fn post<R>(&self, op: VaultOp, reply_rx: std::sync::mpsc::Receiver<R>) -> Result<R, StorageError> {
+        self.ops
+            .lock()
+            .map_err(|_| StorageError::Vault("vault mailbox lock poisoned".to_string()))?
+            .send(op)
+            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))
+    }
 }
 
 impl FlatStorage {
@@ -181,11 +263,17 @@ impl FlatStorage {
         }
 
         let vault = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, unix_now())?;
+        // Hand the engine to its librarian — from here on, only that thread touches manifestus.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("kete-librarian".to_string())
+            .spawn(move || librarian(vault, rx))
+            .map_err(|e| StorageError::Io(e))?;
         Ok(Self {
             app_id: app.id.to_string(),
             vault_seed,
             secret,
-            vault: Mutex::new(vault),
+            ops: Mutex::new(tx),
             healed_at_open,
             encrypt,
         })
@@ -207,27 +295,26 @@ impl FlatStorage {
     }
 
     /// Write data at a caller-supplied 32-byte vault **address**. For callers who already hold the address as bytes (an identity seed, a conversation id) — no text-encoding round-trip. Encrypts with the per-address ChaCha20-Poly1305 key; durable on return (a spine generation references the new state on at least one verified mirror). The address is the AEAD key input, so a value written here reads back identically whether reached via this method or via [`write`](Self::write) with a string that hashes to the same address.
+    /// Encrypt runs HERE on the caller's thread — the librarian only does vault IO, so a big value's AEAD work never delays anyone else's op.
     pub fn write_addr(&self, addr: &[u8; 32], data: &[u8]) -> Result<(), StorageError> {
         let stored = if self.encrypt {
             encrypt_bytes(data, &self.derive_enc_key_for_addr(addr)).map_err(StorageError::Crypto)?
         } else {
             data.to_vec()
         };
-        let mut vault = self
-            .vault
-            .lock()
-            .map_err(|_| StorageError::Vault("FlatStorage mutex poisoned".to_string()))?;
-        vault.put(addr, &stored, unix_now())?;
-        Ok(())
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Put { addr: *addr, stored, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
     }
 
     /// Read the value at a 32-byte vault **address**. Returns `None` if absent. Every block on the path is hash-verified by manifestus.
+    /// Reads jump the librarian's queued writes (see [`librarian`]), so this waits for at most one in-flight write — never a persist burst. Decrypt runs on the caller's thread.
     pub fn read_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
-        let mut vault = self
-            .vault
-            .lock()
-            .map_err(|_| StorageError::Vault("FlatStorage mutex poisoned".to_string()))?;
-        let Some(stored) = vault.get(addr)? else {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        let stored = self
+            .post(VaultOp::Get { addr: *addr, reply }, reply_rx)?
+            .map_err(StorageError::Vault)?;
+        let Some(stored) = stored else {
             return Ok(None);
         };
         if !self.encrypt {
@@ -240,12 +327,9 @@ impl FlatStorage {
 
     /// Remove the value at a 32-byte vault **address**. Blocks zeroed on both mirrors immediately; the plow reaps the slots.
     pub fn delete_addr(&self, addr: &[u8; 32]) -> Result<(), StorageError> {
-        let mut vault = self
-            .vault
-            .lock()
-            .map_err(|_| StorageError::Vault("FlatStorage mutex poisoned".to_string()))?;
-        vault.delete(addr, unix_now())?;
-        Ok(())
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Delete { addr: *addr, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
     }
 
     /// This vault's seed — the identity the vault is for. Callers use it as the `scope` for self/global entries (the vault's own contact index, settings, our own avatar), since a self-scoped entry belongs to *this* vault and the seed is already held here.
@@ -255,8 +339,11 @@ impl FlatStorage {
 
     /// True if the mirrors diverged at open (and were healed) or a mirror died mid-session.
     pub fn degraded(&self) -> bool {
-        self.healed_at_open
-            || self.vault.lock().map(|mut v| v.degraded()).unwrap_or(true)
+        if self.healed_at_open {
+            return true;
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Degraded { reply }, reply_rx).unwrap_or(true)
     }
 
     // ======================================================================== Internal key derivation ================================================
@@ -405,6 +492,30 @@ mod tests {
         a.write("secret", b"hunter2").unwrap();
         let b = FlatStorage::new(APP, [0x22; 32], [2u8; 32]).unwrap();
         assert!(b.read("secret").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_writers_and_readers_hold_read_your_writes() {
+        // The librarian serializes ops without a shared mutex; each thread's own write-then-read must still see its write (the sync wrapper's durable-on-return makes this ordering, not luck). Four threads hammer disjoint keys around a fat value that keeps the librarian busy.
+        let store = std::sync::Arc::new(FlatStorage::new(APP, [0x44; 32], [5u8; 32]).unwrap());
+        let fat = vec![0xAB_u8; 512 * 1024];
+        let handles: Vec<_> = (0u8..4)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                let fat = fat.clone();
+                std::thread::spawn(move || {
+                    for i in 0u8..8 {
+                        let addr = [t.wrapping_mul(64).wrapping_add(i); 32];
+                        let value = if i % 2 == 0 { fat.clone() } else { vec![t, i] };
+                        store.write_addr(&addr, &value).unwrap();
+                        assert_eq!(store.read_addr(&addr).unwrap().as_deref(), Some(&value[..]));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
