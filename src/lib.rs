@@ -159,13 +159,37 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
         }
         match mutation {
             Some(VaultOp::Put { addr, stored, reply }) => {
-                let _ = reply.send(vault.put(&addr, &stored, unix_now()).map_err(|e| e.to_string()));
+                let _ = reply.send(put_growing(&mut vault, &addr, &stored));
             }
             Some(VaultOp::Delete { addr, reply }) => {
                 let _ = reply.send(vault.delete(&addr, unix_now()).map(|_| ()).map_err(|e| e.to_string()));
             }
             _ => {}
         }
+    }
+}
+
+/// Put with the designed-but-never-wired growth path: manifestus's put already runs the plow before conceding, so TractFull means the tract is genuinely full of LIVE data — double it (fallocate + commit, fence-conservative per `Vault::grow`) and retry once. Doubling amortizes: a vault that filled once will fill again.
+/// This was the missing link behind photon's 2026-08-16 field failure: a 16MB-initial vault filled and every settings/phonebook/zoom persist died with "tract full" — 304 dropped writes in one session log — because nothing ever called grow.
+fn put_growing(
+    vault: &mut Vault<FileDev, FileDev>,
+    addr: &[u8; 32],
+    stored: &[u8],
+) -> Result<(), String> {
+    match vault.put(addr, stored, unix_now()) {
+        Err(manifestus::Error::TractFull) => {
+            let target = vault.tract_blocks().saturating_mul(2);
+            log::info!(
+                "kete: tract full of live data — growing {} -> {} blocks",
+                vault.tract_blocks(),
+                target
+            );
+            vault
+                .grow(target, unix_now())
+                .map_err(|e| format!("vault grow: {e}"))?;
+            vault.put(addr, stored, unix_now()).map_err(|e| e.to_string())
+        }
+        r => r.map_err(|e| e.to_string()),
     }
 }
 
@@ -492,6 +516,22 @@ mod tests {
         a.write("secret", b"hunter2").unwrap();
         let b = FlatStorage::new(APP, [0x22; 32], [2u8; 32]).unwrap();
         assert!(b.read("secret").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_full_tract_grows_instead_of_dying() {
+        // Write well past the 16MB initial tract with values that stay LIVE (distinct addresses, no deletes) — the plow can reclaim nothing, so without the growth path every write past the lap dies with TractFull (the 2026-08-16 photon field failure). Read a sample back across the growth boundary.
+        let store = FlatStorage::new(APP, [0x55; 32], [6u8; 32]).unwrap();
+        let chunk = vec![0xCD_u8; 256 * 1024];
+        for i in 0u8..96 {
+            let addr = [i; 32];
+            store.write_addr(&addr, &chunk).unwrap();
+        }
+        for i in [0u8, 47, 95] {
+            let got = store.read_addr(&[i; 32]).unwrap().expect("value survives growth");
+            assert_eq!(got.len(), chunk.len());
+            assert!(got.iter().all(|b| *b == 0xCD));
+        }
     }
 
     #[test]
