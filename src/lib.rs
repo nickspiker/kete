@@ -88,6 +88,25 @@ pub fn encrypt_bytes(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String
     Ok(out)
 }
 
+/// The logical-string entry address, exposed for inspection tooling beside [`derive_addr_key`].
+pub fn derive_entry_addr(app_id: &str, key: &str) -> [u8; 32] {
+    blake3::derive_key(&format!("{}.storage.entry.v0", app_id), key.as_bytes())
+}
+
+/// A domain-scoped entry address (photon's `vault_key` shape): same context, input = domain bytes ‖ 32-byte scope.
+pub fn derive_scoped_addr(app_id: &str, domain: &str, scope: &[u8; 32]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(domain.len() + 32);
+    input.extend_from_slice(domain.as_bytes());
+    input.extend_from_slice(scope);
+    blake3::derive_key(&format!("{}.storage.entry.v0", app_id), &input)
+}
+
+/// The per-address AEAD key derivation, exposed for inspection tooling (keteinfo, photon-settings-inspect) that opens COPIED ring files outside a FlatStorage — the one derivation, never duplicated.
+pub fn derive_addr_key(app_id: &str, addr: &[u8; 32], vault_seed: &[u8; 32], secret: &[u8; 32]) -> [u8; 32] {
+    let context = [addr.as_slice(), vault_seed.as_slice(), secret.as_slice()].concat();
+    blake3::derive_key(&format!("{}.storage.encryption.v0", app_id), &context)
+}
+
 /// Decrypt a blob produced by [`encrypt_bytes`]. AEAD failure (wrong key, tamper, truncation) flows thru as a stringified error.
 pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     if blob.len() < 12 + 16 {
@@ -374,18 +393,12 @@ impl FlatStorage {
 
     /// Per-address AEAD key: domain-separated by app, bound to the vault entry address + the vault seed + the vault `secret`. Keyed on the 32-byte address rather than any logical string, so the string and byte-addressed APIs that resolve to the same address produce the same AEAD key.
     fn derive_enc_key_for_addr(&self, addr: &[u8; 32]) -> [u8; 32] {
-        let context = [
-            addr.as_slice(),
-            self.vault_seed.as_slice(),
-            self.secret.as_slice(),
-        ]
-        .concat();
-        blake3::derive_key(&format!("{}.storage.encryption.v0", self.app_id), &context)
+        derive_addr_key(&self.app_id, addr, &self.vault_seed, &self.secret)
     }
 
     /// Fixed 32-byte vault entry address for a logical string key. The vault file is already per-(app, handle, device), so no identity material is mixed here — only the app domain + the key.
     fn derive_entry_key(&self, key: &str) -> [u8; 32] {
-        blake3::derive_key(&format!("{}.storage.entry.v0", self.app_id), key.as_bytes())
+        derive_entry_addr(&self.app_id, key)
     }
 }
 
