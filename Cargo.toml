@@ -22,6 +22,8 @@ path = "src/bin/keteinfo.rs"
 # step with the published manifestus/tohu versions.
 manifestus = { version = "0.0.1", path = "../manifestus" }
 tohu = { version = "0.0.1", path = "../tohu" }
+# VSF rendering for keteinfo: a decrypted value that parses as a VSF document prints as one.
+vsf = { path = "../vsf", features = ["inspect"] }
 
 # Crypto — versions matched to photon so a shared dep graph unifies cleanly.
 blake3 = "1.5"
