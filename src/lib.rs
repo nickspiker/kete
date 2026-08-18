@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
 use chacha20poly1305::{
-    ChaCha20Poly1305, Nonce,
+    ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
 use manifestus::{FileDev, Mirror, Vault, HOST_RING_LOG2, verified_replicate};
@@ -75,14 +75,16 @@ impl std::error::Error for StorageError {}
 
 // ============================================================================ Shared encryption ==========================================================
 
-/// Encrypt with ChaCha20-Poly1305 + a fresh 12-byte random nonce. Output layout is `[nonce: 12B] || [ciphertext + 16B auth tag]`. One call site for the whole stack so a future change (algorithm bump, AAD scheme) lands in one place.
+/// Encrypt with XChaCha20-Poly1305 + a fresh 24-byte random nonce. Output layout is `[nonce: 24B] || [ciphertext + 16B auth tag]`. One call site for the whole stack so a future change (algorithm bump, AAD scheme) lands in one place.
+///
+/// The 192-bit nonce (2026-08-18 migration from ChaCha20-Poly1305's 96-bit) removes the birthday bound on random nonces entirely: a fleet may seal unbounded values under one key with no collision concern. [`decrypt_bytes`] still reads the legacy 12-byte-nonce format, so vaults upgrade lazily on each value's next write.
 pub fn encrypt_bytes(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let mut nonce_bytes = [0u8; 12];
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let mut nonce_bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from(nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
     let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    let mut out = Vec::with_capacity(24 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
     Ok(out)
@@ -107,18 +109,33 @@ pub fn derive_addr_key(app_id: &str, addr: &[u8; 32], vault_seed: &[u8; 32], sec
     blake3::derive_key(&format!("{}.storage.encryption.v0", app_id), &context)
 }
 
-/// Decrypt a blob produced by [`encrypt_bytes`]. AEAD failure (wrong key, tamper, truncation) flows thru as a stringified error.
+/// Decrypt a blob produced by [`encrypt_bytes`]. Reads the current XChaCha20-Poly1305 (24-byte nonce) format first, then falls back to the legacy ChaCha20-Poly1305 (12-byte nonce) format for values written before the 2026-08-18 migration. The Poly1305 tag is the disambiguator — a wrong-width attempt fails authentication (2^-128 spurious-pass), so no version byte is needed; a value re-writes into the new format on its next `write`. AEAD failure under BOTH formats (wrong key, tamper, truncation) flows thru as a stringified error.
+///
+/// MIGRATION: drop the legacy branch once every fleet vault has been fully rewritten (a few versions out) — the birthday-bound-erasing 24-byte nonce is the only format we mint now.
 pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
-    if blob.len() < 12 + 16 {
-        return Err(format!(
-            "ciphertext too short: {} bytes (need ≥ 28 for nonce + auth tag)",
-            blob.len()
-        ));
+    // Current: XChaCha20-Poly1305, [nonce:24][ct+tag].
+    if blob.len() >= 24 + 16 {
+        let (nonce_bytes, ciphertext) = blob.split_at(24);
+        if let Ok(nonce) = XNonce::try_from(nonce_bytes) {
+            if let Ok(pt) = XChaCha20Poly1305::new(key.into()).decrypt(&nonce, ciphertext) {
+                return Ok(pt);
+            }
+        }
     }
-    let (nonce_bytes, ciphertext) = blob.split_at(12);
-    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| "invalid nonce length".to_string())?;
-    let cipher = ChaCha20Poly1305::new(key.into());
-    cipher.decrypt(&nonce, ciphertext).map_err(|e| e.to_string())
+    // Legacy: ChaCha20-Poly1305, [nonce:12][ct+tag].
+    if blob.len() >= 12 + 16 {
+        let (nonce_bytes, ciphertext) = blob.split_at(12);
+        if let Ok(nonce) = Nonce::try_from(nonce_bytes) {
+            if let Ok(pt) = ChaCha20Poly1305::new(key.into()).decrypt(&nonce, ciphertext) {
+                return Ok(pt);
+            }
+        }
+        return Err("decrypt failed under both XChaCha and legacy ChaCha formats".to_string());
+    }
+    Err(format!(
+        "ciphertext too short: {} bytes (need ≥ 28 for a legacy nonce + tag)",
+        blob.len()
+    ))
 }
 
 // ============================================================================ The librarian ==============================================================
@@ -505,9 +522,28 @@ mod tests {
         let key = [9u8; 32];
         let pt = b"the quick brown fox";
         let blob = encrypt_bytes(pt, &key).unwrap();
-        assert_ne!(&blob[12..], &pt[..]); // ciphertext is not the plaintext
+        assert_eq!(&blob[..24].len(), &24); // 24-byte XChaCha nonce prefix
+        assert_ne!(&blob[24..], &pt[..]); // ciphertext is not the plaintext
         assert_eq!(decrypt_bytes(&blob, &key).unwrap(), pt);
         assert!(decrypt_bytes(&blob, &[8u8; 32]).is_err()); // wrong key fails the AEAD tag
+    }
+
+    /// A value sealed under the LEGACY ChaCha20-Poly1305 (12-byte nonce) format must still open — the
+    /// read-both migration path. Synthesizes a legacy blob directly (the old encrypt is gone).
+    #[test]
+    fn decrypts_legacy_12byte_nonce_format() {
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+        let key = [7u8; 32];
+        let pt = b"a pre-migration vault value";
+        let nonce_bytes = [0x42u8; 12];
+        let ct = ChaCha20Poly1305::new((&key).into())
+            .encrypt(&Nonce::from(nonce_bytes), &pt[..])
+            .unwrap();
+        let mut legacy = nonce_bytes.to_vec();
+        legacy.extend_from_slice(&ct);
+        assert_eq!(decrypt_bytes(&legacy, &key).unwrap(), pt);
+        // And the wrong key still fails under the legacy branch too.
+        assert!(decrypt_bytes(&legacy, &[1u8; 32]).is_err());
     }
 
     #[test]
