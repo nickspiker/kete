@@ -219,21 +219,43 @@ fn put_growing(
     addr: &[u8; 32],
     stored: &[u8],
 ) -> Result<(), String> {
-    match vault.put(addr, stored, unix_now()) {
-        Err(manifestus::Error::TractFull) => {
-            let target = vault.tract_blocks().saturating_mul(2);
-            log::info!(
-                "kete: tract full of live data — growing {} -> {} blocks",
-                vault.tract_blocks(),
-                target
-            );
-            vault
-                .grow(target, unix_now())
-                .map_err(|e| format!("vault grow: {e}"))?;
-            vault.put(addr, stored, unix_now()).map_err(|e| e.to_string())
-        }
-        r => r.map_err(|e| e.to_string()),
+    // PRE-SIZE for big values: a put discovers TractFull only after writing blocks up to the wall, so growing by failed-pass doubling on a 500MB value re-writes hundreds of wasted MB per rung (measured 78s for a 500MB store). Estimate the block need conservatively (payload ≈ 3.8KB/block; use 3KB so we over-grow, never under) and grow ONCE before the first attempt.
+    const EST_PAYLOAD_PER_BLOCK: u64 = 3072;
+    let needed = (stored.len() as u64 / EST_PAYLOAD_PER_BLOCK) + 64;
+    let floor = vault.live_blocks() as u64 + needed;
+    let mut target = vault.tract_blocks();
+    while target < floor {
+        target = target.saturating_mul(2);
     }
+    if target > vault.tract_blocks() {
+        log::info!(
+            "kete: pre-sizing tract for a {}-byte value — growing {} -> {} blocks",
+            stored.len(),
+            vault.tract_blocks(),
+            target
+        );
+        vault
+            .grow(target, unix_now())
+            .map_err(|e| format!("vault grow: {e}"))?;
+    }
+    // Doubling LOOPS as the backstop (fragmentation can defeat the estimate): one doubling covered settings-sized writes, but a big blob legitimately needs several. Bounded — 40 doublings from any sane start exceeds every real disk, so hitting the bound means a growth bug, not a big value.
+    for _ in 0..40 {
+        match vault.put(addr, stored, unix_now()) {
+            Err(manifestus::Error::TractFull) => {
+                let target = vault.tract_blocks().saturating_mul(2);
+                log::info!(
+                    "kete: tract full of live data — growing {} -> {} blocks",
+                    vault.tract_blocks(),
+                    target
+                );
+                vault
+                    .grow(target, unix_now())
+                    .map_err(|e| format!("vault grow: {e}"))?;
+            }
+            r => return r.map_err(|e| e.to_string()),
+        }
+    }
+    Err("vault grow loop exhausted — growth is not sticking".to_string())
 }
 
 // ============================================================================ FlatStorage ================================================================
