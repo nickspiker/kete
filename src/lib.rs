@@ -421,22 +421,25 @@ impl FlatStorage {
 
 // ============================================================================ Vault path resolution ======================================================
 
-/// Android vault dir override — populated once at startup from the host's JNI shim. `dirs::config_dir()` doesn't resolve on Android; the right scope is the app-private dirs Java side hands us. Tuple is `(primary, shadow)`.
-#[cfg(target_os = "android")]
-static ANDROID_VAULT_DIRS: Mutex<Option<(String, String)>> = Mutex::new(None);
+/// Vault dir override — platform-neutral (generalized 2026-08-20 from the Android-only version). Two callers: the Android JNI shim (dirs::config_dir() doesn't resolve there; app-private dirs come from the Java side) and TESTS (a test that forgets this writes real 17MB vault rings into the developer's live config dir — the "eight vaults, recent timestamps" field mystery). Tuple is `(primary, shadow)`.
+static VAULT_DIRS_OVERRIDE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
-/// Inject the Android dual-ring vault directories. Must be called before any storage operation. The JNI shim wires it from native init.
-#[cfg(target_os = "android")]
-pub fn set_android_vault_dirs(primary: String, shadow: String) {
-    if let Ok(mut g) = ANDROID_VAULT_DIRS.lock() {
+/// Inject the dual-ring vault directories. Android: the JNI shim wires it from native init, before any storage op. Tests: point at a tempdir FIRST — never let a test touch the real config dir.
+pub fn set_vault_dirs_override(primary: String, shadow: String) {
+    if let Ok(mut g) = VAULT_DIRS_OVERRIDE.lock() {
         *g = Some((primary, shadow));
     }
 }
 
-/// The injected Android `(primary, shadow)` vault directories, if set. Exposed so a device-clean can wipe the ACTUAL vault dirs on Android — `dirs::config_dir()` doesn't resolve there, so a wipe that walked it would silently no-op.
+/// Back-compat alias for the JNI shim's existing call site.
 #[cfg(target_os = "android")]
+pub fn set_android_vault_dirs(primary: String, shadow: String) {
+    set_vault_dirs_override(primary, shadow);
+}
+
+/// The injected `(primary, shadow)` vault directories, if set. Exposed so a device-clean can wipe the ACTUAL vault dirs on Android — `dirs::config_dir()` doesn't resolve there, so a wipe that walked it would silently no-op.
 pub fn android_vault_dirs() -> Option<(String, String)> {
-    ANDROID_VAULT_DIRS.lock().ok().and_then(|g| g.clone())
+    VAULT_DIRS_OVERRIDE.lock().ok().and_then(|g| g.clone())
 }
 
 /// Resolve the two ring paths for the given per-handle filename. Files live under `<config_dir>/<dir>/<filename>.vsf` and `<data_dir>/<dir>/<filename>.vsf`. On Linux + Windows the XDG split gives different directories. On macOS `config_dir()` and `data_dir()` collide; the shadow then shares the directory with `<filename>.shadow.vsf`. On Android the dirs come from the JNI shim.
@@ -450,18 +453,12 @@ fn vault_paths(dir: &str, filename: &str) -> Result<[PathBuf; 2], StorageError> 
     let primary_name = format!("{}.vsf", filename);
     let shadow_name = format!("{}{}.vsf", filename, VAULT_SHADOW_SUFFIX);
 
-    #[cfg(target_os = "android")]
-    {
-        let dirs = ANDROID_VAULT_DIRS
-            .lock()
-            .map_err(|e| StorageError::Io(std::io::Error::other(format!("vault-dir lock: {}", e))))?
-            .clone()
-            .ok_or_else(|| {
-                StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Android vault dirs not set — JNI shim must call set_android_vault_dirs",
-                ))
-            })?;
+    // The override wins on EVERY platform: Android requires it (no XDG dirs), tests use it to stay out of the developer's real config dir.
+    let override_dirs = VAULT_DIRS_OVERRIDE
+        .lock()
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("vault-dir lock: {}", e))))?
+        .clone();
+    if let Some(dirs) = override_dirs {
         let primary_dir = PathBuf::from(&dirs.0).join(dir);
         let shadow_dir = if dirs.1.is_empty() {
             primary_dir.clone()
@@ -475,6 +472,14 @@ fn vault_paths(dir: &str, filename: &str) -> Result<[PathBuf; 2], StorageError> 
             shadow_dir.join(&primary_name)
         };
         return Ok([primary, shadow]);
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Android vault dirs not set — JNI shim must call set_android_vault_dirs",
+        )));
     }
 
     #[cfg(not(target_os = "android"))]
@@ -517,6 +522,15 @@ mod tests {
         dir: "kete-test",
     };
 
+    /// Every disk-touching test routes thru the tempdir override — a test that forgets writes REAL vault rings into the developer's home (the "eight vaults, recent timestamps" field mystery, 2026-08-20). Idempotent and process-global: all tests share one tmp root.
+    fn isolate() {
+        let root = std::env::temp_dir().join("kete-tests");
+        set_vault_dirs_override(
+            root.join("cfg").to_string_lossy().into_owned(),
+            root.join("data").to_string_lossy().into_owned(),
+        );
+    }
+
     #[test]
     fn encrypt_round_trip() {
         let key = [9u8; 32];
@@ -548,6 +562,7 @@ mod tests {
 
     #[test]
     fn vault_round_trip() {
+        isolate();
         let store = FlatStorage::new(APP, [0x11; 32], [3u8; 32]).unwrap();
         assert!(store.read("k").unwrap().is_none());
         store.write("k", b"value").unwrap();
@@ -561,6 +576,7 @@ mod tests {
     #[test]
     fn secret_separates_vaults() {
         // Same app + seed, different device secret → a different vault file, so one device's data is invisible to the other.
+        isolate();
         let a = FlatStorage::new(APP, [0x22; 32], [1u8; 32]).unwrap();
         a.write("secret", b"hunter2").unwrap();
         let b = FlatStorage::new(APP, [0x22; 32], [2u8; 32]).unwrap();
@@ -570,6 +586,7 @@ mod tests {
     #[test]
     fn a_full_tract_grows_instead_of_dying() {
         // Write well past the 16MB initial tract with values that stay LIVE (distinct addresses, no deletes) — the plow can reclaim nothing, so without the growth path every write past the lap dies with TractFull (the 2026-08-16 photon field failure). Read a sample back across the growth boundary.
+        isolate();
         let store = FlatStorage::new(APP, [0x55; 32], [6u8; 32]).unwrap();
         let chunk = vec![0xCD_u8; 256 * 1024];
         for i in 0u8..96 {
@@ -586,6 +603,7 @@ mod tests {
     #[test]
     fn concurrent_writers_and_readers_hold_read_your_writes() {
         // The librarian serializes ops without a shared mutex; each thread's own write-then-read must still see its write (the sync wrapper's durable-on-return makes this ordering, not luck). Four threads hammer disjoint keys around a fat value that keeps the librarian busy.
+        isolate();
         let store = std::sync::Arc::new(FlatStorage::new(APP, [0x44; 32], [5u8; 32]).unwrap());
         let fat = vec![0xAB_u8; 512 * 1024];
         let handles: Vec<_> = (0u8..4)
@@ -609,6 +627,7 @@ mod tests {
 
     #[test]
     fn plaintext_round_trip() {
+        isolate();
         let store = FlatStorage::new_plaintext(APP, [0x33; 32], [4u8; 32]).unwrap();
         store.write("k", b"in the clear").unwrap();
         assert_eq!(store.read("k").unwrap().as_deref(), Some(&b"in the clear"[..]));
