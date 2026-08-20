@@ -158,6 +158,10 @@ enum VaultOp {
     Degraded {
         reply: std::sync::mpsc::Sender<bool>,
     },
+    /// Every live entry address — the migration enumeration (see [`FlatStorage::live_addrs`]).
+    Keys {
+        reply: std::sync::mpsc::Sender<Result<Vec<[u8; 32]>, String>>,
+    },
 }
 
 /// The librarian: the ONE thread that owns the manifestus engine — no mutex exists, so a blocked reader is structurally impossible rather than a per-call-site discipline.
@@ -186,6 +190,9 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                 }
                 VaultOp::Degraded { reply } => {
                     let _ = reply.send(vault.degraded());
+                }
+                VaultOp::Keys { reply } => {
+                    let _ = reply.send(vault.live_keys().map_err(|e| e.to_string()));
                 }
                 m => {
                     mutation = Some(m);
@@ -482,6 +489,41 @@ impl FlatStorage {
         blake3::derive_key(&format!("{}.storage.entry.device.v1", self.app_id), key.as_bytes())
     }
 
+    // ======================================================================== Migration (enumeration + raw copy) =====================================
+
+    /// Every live entry ADDRESS in the vault, enumerated from the committed trie — complete by construction (manifestus leaves carry their keys), zero domain knowledge needed.
+    /// This is the migration walk: `for addr in old.live_addrs() { new.write_stored(&addr, old.read_stored(&addr)) }` moves a whole vault verbatim.
+    pub fn live_addrs(&self) -> Result<Vec<[u8; 32]>, StorageError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Keys { reply }, reply_rx)?.map_err(StorageError::Vault)
+    }
+
+    /// The raw STORED bytes at an address — ciphertext and all, no decrypt. Migration-only: entry keys derive from (app, addr, scope secrets), not from which vault file holds the value, so stored bytes copied to the same address in another vault with the same secrets decrypt identically.
+    pub fn read_stored(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Get { addr: *addr, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
+    /// Write raw STORED bytes at an address — no encrypt, the value is already sealed by its source vault. Migration-only counterpart of [`read_stored`](Self::read_stored); durable on return.
+    pub fn write_stored(&self, addr: &[u8; 32], stored: &[u8]) -> Result<(), StorageError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Put { addr: *addr, stored: stored.to_vec(), reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
+    /// Copy EVERY live entry of `source` into this vault, stored-bytes verbatim at the same addresses. Returns the entry count. The no-data-loss migration primitive: complete by construction (trie enumeration), idempotent (same addr + same bytes = overwrite with itself).
+    pub fn adopt_all_entries_from(&self, source: &FlatStorage) -> Result<usize, StorageError> {
+        let addrs = source.live_addrs()?;
+        for addr in &addrs {
+            let Some(stored) = source.read_stored(addr)? else {
+                continue; // deleted between enumeration and read — nothing to carry
+            };
+            self.write_stored(addr, &stored)?;
+        }
+        Ok(addrs.len())
+    }
+
     /// True if the mirrors diverged at open (and were healed) or a mirror died mid-session.
     pub fn degraded(&self) -> bool {
         if self.healed_at_open {
@@ -616,13 +658,48 @@ mod tests {
         dir: "kete-test",
     };
 
-    /// Every disk-touching test routes thru the tempdir override — a test that forgets writes REAL vault rings into the developer's home (the "eight vaults, recent timestamps" field mystery, 2026-08-20). Idempotent and process-global: all tests share one tmp root.
+    /// Every disk-touching test routes thru the tempdir override — a test that forgets writes REAL vault rings into the developer's home (the "eight vaults, recent timestamps" field mystery, 2026-08-20). Process-global: all tests in one run share one tmp root, but the root is per-PID so a PREVIOUS run's vault files never leak into this run's "fresh vault" assumptions (the identity-gate test found last run's entries and correctly refused to read them pre-identity).
     fn isolate() {
-        let root = std::env::temp_dir().join("kete-tests");
+        let root = std::env::temp_dir().join(format!("kete-tests-{}", std::process::id()));
+        static CLEAN: std::sync::Once = std::sync::Once::new();
+        CLEAN.call_once(|| {
+            let _ = std::fs::remove_dir_all(&root); // pid-reuse insurance — once per process, BEFORE any test writes; sibling tests only ever see the fresh root
+        });
         set_vault_dirs_override(
             root.join("cfg").to_string_lossy().into_owned(),
             root.join("data").to_string_lossy().into_owned(),
         );
+    }
+
+    /// THE migration contract: a legacy per-identity vault's entries, raw-copied thru live_addrs/read_stored/write_stored into a device-first vault, decrypt identically once set_identity lands — string keys, addr entries, and the sprawl-absorbing device scope all coexisting.
+    #[test]
+    fn adopt_all_entries_migrates_legacy_vault_verbatim() {
+        isolate();
+        let identity = [0xD7u8; 32];
+        let secret = [0xD8u8; 32];
+        let legacy = FlatStorage::new(APP, identity, secret).unwrap();
+        legacy.write("contacts/index", b"alice,bob").unwrap();
+        legacy.write("chains/head", b"generation-9").unwrap();
+        let addr = [0xA5u8; 32];
+        legacy.write_addr(&addr, b"avatar-bytes").unwrap();
+
+        let device = FlatStorage::open_device_shared(APP, secret).unwrap();
+        device.write_device("binding/marker", b"pre-attest-survives").unwrap();
+        let carried = device.adopt_all_entries_from(&legacy).unwrap();
+        assert_eq!(carried, 3, "trie enumeration finds every legacy entry");
+
+        // Pre-identity the ciphertexts are present but unreadable — identity-scope keys don't exist yet.
+        assert!(device.read("contacts/index").is_err());
+        device.set_identity(identity).unwrap();
+        assert_eq!(device.read("contacts/index").unwrap(), Some(b"alice,bob".to_vec()));
+        assert_eq!(device.read("chains/head").unwrap(), Some(b"generation-9".to_vec()));
+        assert_eq!(device.read_addr(&addr).unwrap(), Some(b"avatar-bytes".to_vec()));
+        assert_eq!(device.read_device("binding/marker").unwrap(), Some(b"pre-attest-survives".to_vec()));
+
+        // Idempotent: a re-run (crash-between-marker-and-copy insurance) changes nothing.
+        let again = device.adopt_all_entries_from(&legacy).unwrap();
+        assert_eq!(again, 3);
+        assert_eq!(device.read("contacts/index").unwrap(), Some(b"alice,bob".to_vec()));
     }
 
     #[test]
