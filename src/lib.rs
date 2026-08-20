@@ -236,8 +236,8 @@ fn put_growing(
 pub struct FlatStorage {
     /// `App::id` — feeds `vault_path_name` and the per-key KDF context strings.
     app_id: String,
-    /// The vault seed (identity_seed). One input to per-key encryption keys and the vault filename.
-    vault_seed: [u8; 32],
+    /// The IDENTITY seed, when one exists. Legacy per-identity vaults carry it from construction; a device-first vault (open_device*) starts None and gains it via [`set_identity`](Self::set_identity) at attest — Nick's key model 2026-08-20: entries are keyed hash(thing|device) pre-attest and hash(thing|device|person) after.
+    identity: Mutex<Option<[u8; 32]>>,
     /// The 32-byte secret the vault is bound to — mixed into both the vault filename and every per-key encryption key. `tohu::device::device_secret()` locks the vault to this machine; any portable secret (passphrase-derived, identity key) makes a vault that opens on any machine holding that secret.
     secret: [u8; 32],
     /// The librarian's mailbox.
@@ -265,12 +265,14 @@ impl FlatStorage {
 impl FlatStorage {
     /// Open an encrypted vault (per-key ChaCha20-Poly1305), keyed on `secret`. `secret` is mixed into both the filename and every value's key, so the same `(app, seed, secret)` reproduces the same vault and decryption anywhere. Pass `tohu::device::device_secret()` to lock the vault to this machine; pass a portable secret (passphrase-derived, identity key) for a vault you can move to or open on another machine.
     pub fn new(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
-        Self::open(app, vault_seed, secret, true)
+        let filename = tohu::vault_path_name(app.id, &vault_seed, &secret);
+        Self::open(app, filename, Some(vault_seed), secret, true)
     }
 
     /// Open a vault that stores values in **plaintext** — same addressing, durability, and integrity (manifestus still BLAKE3-seals every block), but no per-key encryption, so values stay inspectable on disk. Use for data that isn't secret; do NOT use for secrets (a plaintext vault file is readable by anyone who can read it). `secret` still scopes the vault path (machine-bound or portable, your choice).
     pub fn new_plaintext(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Self, StorageError> {
-        Self::open(app, vault_seed, secret, false)
+        let filename = tohu::vault_path_name(app.id, &vault_seed, &secret);
+        Self::open(app, filename, Some(vault_seed), secret, false)
     }
 
     /// Open the vault as the ONE process-wide shared engine for its file — every `open_shared` of the same `(app, seed, secret)` returns the same `Arc<FlatStorage>`, so all threads serialize on one engine and one in-RAM state.
@@ -293,13 +295,52 @@ impl FlatStorage {
             }
         }
         // Held across the open on purpose: a second thread racing this open must wait and receive the same engine, never construct its own.
-        let vault = Arc::new(Self::open(app, vault_seed, secret, true)?);
+        let vault = Arc::new(Self::open(app, filename.clone(), Some(vault_seed), secret, true)?);
         reg.push((filename, Arc::downgrade(&vault)));
         Ok(vault)
     }
 
-    fn open(app: App, vault_seed: [u8; 32], secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
-        let filename = tohu::vault_path_name(app.id, &vault_seed, &secret);
+    /// Open the ONE device vault — exists from FIRST LAUNCH, named from the device secret alone (tohu::device_vault_path_name), no identity required. Device-scope entries (`*_device` methods) work immediately; identity-scope entries unlock via [`set_identity`](Self::set_identity) at attest. Same process-wide shared-engine registry as [`open_shared`](Self::open_shared).
+    pub fn open_device_shared(app: App, device_secret: [u8; 32]) -> Result<Arc<Self>, StorageError> {
+        static OPEN_DEVICE_VAULTS: Mutex<Vec<(String, Weak<FlatStorage>)>> = Mutex::new(Vec::new());
+        let filename = tohu::device_vault_path_name(app.id, &device_secret);
+        let mut reg = OPEN_DEVICE_VAULTS
+            .lock()
+            .map_err(|e| StorageError::Io(std::io::Error::other(format!("vault registry lock: {}", e))))?;
+        reg.retain(|(_, w)| w.strong_count() > 0);
+        if let Some((_, w)) = reg.iter().find(|(f, _)| *f == filename) {
+            if let Some(live) = w.upgrade() {
+                return Ok(live);
+            }
+        }
+        let vault = Arc::new(Self::open(app, filename.clone(), None, device_secret, true)?);
+        reg.push((filename, Arc::downgrade(&vault)));
+        Ok(vault)
+    }
+
+    /// Install the identity seed at attest — identity-scope entries become readable/writable from here on. Idempotent; a DIFFERENT identity than the one already set is refused (one identity per device, D2).
+    pub fn set_identity(&self, identity_seed: [u8; 32]) -> Result<(), StorageError> {
+        let mut g = self
+            .identity
+            .lock()
+            .map_err(|_| StorageError::Vault("identity lock poisoned".to_string()))?;
+        match *g {
+            Some(existing) if existing != identity_seed => Err(StorageError::Crypto(
+                "vault already bound to a different identity (one identity per device)".to_string(),
+            )),
+            _ => {
+                *g = Some(identity_seed);
+                Ok(())
+            }
+        }
+    }
+
+    /// The identity this vault currently serves, if attested.
+    pub fn identity(&self) -> Option<[u8; 32]> {
+        self.identity.lock().ok().and_then(|g| *g)
+    }
+
+    fn open(app: App, filename: String, identity: Option<[u8; 32]>, secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
         let paths = vault_paths(app.dir, &filename)?;
 
         for p in &paths {
@@ -331,7 +372,7 @@ impl FlatStorage {
             .map_err(|e| StorageError::Io(e))?;
         Ok(Self {
             app_id: app.id.to_string(),
-            vault_seed,
+            identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
             healed_at_open,
@@ -358,7 +399,7 @@ impl FlatStorage {
     /// Encrypt runs HERE on the caller's thread — the librarian only does vault IO, so a big value's AEAD work never delays anyone else's op.
     pub fn write_addr(&self, addr: &[u8; 32], data: &[u8]) -> Result<(), StorageError> {
         let stored = if self.encrypt {
-            encrypt_bytes(data, &self.derive_enc_key_for_addr(addr)).map_err(StorageError::Crypto)?
+            encrypt_bytes(data, &self.derive_enc_key_for_addr(addr)?).map_err(StorageError::Crypto)?
         } else {
             data.to_vec()
         };
@@ -381,7 +422,7 @@ impl FlatStorage {
             return Ok(Some(stored));
         }
         let plaintext =
-            decrypt_bytes(&stored, &self.derive_enc_key_for_addr(addr)).map_err(StorageError::Crypto)?;
+            decrypt_bytes(&stored, &self.derive_enc_key_for_addr(addr)?).map_err(StorageError::Crypto)?;
         Ok(Some(plaintext))
     }
 
@@ -392,9 +433,53 @@ impl FlatStorage {
             .map_err(StorageError::Vault)
     }
 
-    /// This vault's seed — the identity the vault is for. Callers use it as the `scope` for self/global entries (the vault's own contact index, settings, our own avatar), since a self-scoped entry belongs to *this* vault and the seed is already held here.
-    pub fn vault_seed(&self) -> &[u8; 32] {
-        &self.vault_seed
+    /// This vault's identity seed — callers use it as the `scope` for self/global entries. Panics only if called on a device vault before [`set_identity`](Self::set_identity); legacy per-identity vaults always carry it. New code should prefer [`identity()`](Self::identity).
+    pub fn vault_seed(&self) -> [u8; 32] {
+        self.identity().expect("vault_seed() before set_identity on a device vault")
+    }
+
+    /// DEVICE-scope string-key ops — readable from first launch, before any identity exists: the pre-attest state (binding marker, boot settings, reboot capsule, opt-in flags) that used to sprawl as loose files.
+    pub fn write_device(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
+        let addr = self.derive_device_entry_key(key);
+        let stored = if self.encrypt {
+            encrypt_bytes(data, &self.derive_device_enc_key_for_addr(&addr)).map_err(StorageError::Crypto)?
+        } else {
+            data.to_vec()
+        };
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Put { addr, stored, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
+    /// DEVICE-scope read — see [`write_device`](Self::write_device).
+    pub fn read_device(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let addr = self.derive_device_entry_key(key);
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        let stored = self
+            .post(VaultOp::Get { addr, reply }, reply_rx)?
+            .map_err(StorageError::Vault)?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if !self.encrypt {
+            return Ok(Some(stored));
+        }
+        let plaintext = decrypt_bytes(&stored, &self.derive_device_enc_key_for_addr(&addr))
+            .map_err(StorageError::Crypto)?;
+        Ok(Some(plaintext))
+    }
+
+    /// DEVICE-scope delete — see [`write_device`](Self::write_device).
+    pub fn delete_device(&self, key: &str) -> Result<(), StorageError> {
+        let addr = self.derive_device_entry_key(key);
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Delete { addr, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
+    /// Device-scope entry ADDRESS — a distinct context from the identity-scope entry address, so the two scopes can never collide on a storage slot even for an identical logical key.
+    fn derive_device_entry_key(&self, key: &str) -> [u8; 32] {
+        blake3::derive_key(&format!("{}.storage.entry.device.v1", self.app_id), key.as_bytes())
     }
 
     /// True if the mirrors diverged at open (and were healed) or a mirror died mid-session.
@@ -408,9 +493,18 @@ impl FlatStorage {
 
     // ======================================================================== Internal key derivation ================================================
 
-    /// Per-address AEAD key: domain-separated by app, bound to the vault entry address + the vault seed + the vault `secret`. Keyed on the 32-byte address rather than any logical string, so the string and byte-addressed APIs that resolve to the same address produce the same AEAD key.
-    fn derive_enc_key_for_addr(&self, addr: &[u8; 32]) -> [u8; 32] {
-        derive_addr_key(&self.app_id, addr, &self.vault_seed, &self.secret)
+    /// Per-address AEAD key, IDENTITY scope: hash(thing|person|device) — the exact derivation legacy per-identity vaults used, so migrated values decrypt unchanged. Errors when no identity is set (pre-attest): identity-scope data cannot exist before an identity does.
+    fn derive_enc_key_for_addr(&self, addr: &[u8; 32]) -> Result<[u8; 32], StorageError> {
+        let identity = self.identity().ok_or_else(|| {
+            StorageError::Crypto("identity not set — pre-attest entries use the *_device methods".to_string())
+        })?;
+        Ok(derive_addr_key(&self.app_id, addr, &identity, &self.secret))
+    }
+
+    /// Per-address AEAD key, DEVICE scope: hash(thing|device) — readable from first launch, before any identity exists. Distinct KDF context keeps the two scopes disjoint even at an identical address.
+    fn derive_device_enc_key_for_addr(&self, addr: &[u8; 32]) -> [u8; 32] {
+        let context = [addr.as_slice(), self.secret.as_slice()].concat();
+        blake3::derive_key(&format!("{}.storage.encryption.device.v1", self.app_id), &context)
     }
 
     /// Fixed 32-byte vault entry address for a logical string key. The vault file is already per-(app, handle, device), so no identity material is mixed here — only the app domain + the key.
@@ -623,6 +717,36 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn device_vault_scopes_and_identity_gate() {
+        isolate();
+        let dev = [0x66u8; 32];
+        {
+            let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+            // Device scope works from first launch, before any identity exists.
+            v.write_device("binding", b"party-id-bytes").unwrap();
+            assert_eq!(v.read_device("binding").unwrap().as_deref(), Some(&b"party-id-bytes"[..]));
+            // Identity scope is GATED until attest — a pre-identity WRITE refuses instead of silently mis-keying; a pre-identity read of an ABSENT key is just absent (no key derivation happens until a value exists).
+            assert!(v.write("contacts", b"x").is_err());
+            assert!(v.read("contacts").unwrap().is_none());
+            // Attest: identity lands, identity scope opens, a DIFFERENT identity is refused (D2).
+            v.set_identity([0x77u8; 32]).unwrap();
+            v.write("contacts", b"alice").unwrap();
+            assert_eq!(v.read("contacts").unwrap().as_deref(), Some(&b"alice"[..]));
+            assert!(v.set_identity([0x78u8; 32]).is_err());
+            assert_eq!(v.vault_seed(), [0x77u8; 32]);
+        }
+        // Reopen: same file (device-named), device entries persist, identity entries readable again after set_identity.
+        let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+        assert_eq!(v.read_device("binding").unwrap().as_deref(), Some(&b"party-id-bytes"[..]));
+        v.set_identity([0x77u8; 32]).unwrap();
+        assert_eq!(v.read("contacts").unwrap().as_deref(), Some(&b"alice"[..]));
+        // The two scopes never collide even on an identical key string.
+        v.write_device("contacts", b"device-side").unwrap();
+        assert_eq!(v.read("contacts").unwrap().as_deref(), Some(&b"alice"[..]));
+        assert_eq!(v.read_device("contacts").unwrap().as_deref(), Some(&b"device-side"[..]));
     }
 
     #[test]
