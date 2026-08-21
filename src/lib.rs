@@ -360,6 +360,8 @@ pub struct FlatStorage {
     secret: [u8; 32],
     /// The librarian's mailbox.
     ops: Mutex<std::sync::mpsc::Sender<VaultOp>>,
+    /// STORED-bytes read cache (ciphertext for encrypted vaults — RAM stays as sealed as disk): reads served from here NEVER touch the librarian, so no read ever waits behind a running commit. The 2026-08-21 field capture showed commits at 1-10s under disk load and every UI hitch was a read stuck behind one (render `pre 3772ms`, conversation-open stalls). Write path inserts BEFORE posting (read-your-own-writes — a racing reader sees the value that is about to be durable); delete removes; `None` caches known-absence so repeated misses skip the round-trip too. Bounded: past CACHE_CAP_BYTES the whole map clears (readers fall thru to the librarian — pure correctness, cold speed).
+    read_cache: Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
     /// Mirrors diverged at open and were replicated back into agreement.
     healed_at_open: bool,
     /// Whether values are encrypted (per-key ChaCha20-Poly1305) before storage. False = plaintext: the vault still gives integrity + durability (manifestus BLAKE3-seals every block), values are just stored as-is and stay inspectable on disk (e.g. `vsfinfo` on a VSF value). The caller's choice — a plaintext vault is not leaked-file-safe.
@@ -493,9 +495,25 @@ impl FlatStorage {
             identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
+            read_cache: Mutex::new(std::collections::HashMap::new()),
             healed_at_open,
             encrypt,
         })
+    }
+
+    /// Read-cache size ceiling (sum of cached value bytes). The whole vault is tens of MB in practice, so a warm session fits; a bulk-content future (avatars, attachments) hits the cap and clears — correctness never depends on residency.
+    const CACHE_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Insert/replace a cache entry, clearing the whole map first if it would exceed the cap.
+    fn cache_put(&self, addr: [u8; 32], stored: Option<Vec<u8>>) {
+        if let Ok(mut c) = self.read_cache.lock() {
+            let incoming = stored.as_ref().map_or(0, |v| v.len());
+            let held: usize = c.values().map(|v| v.as_ref().map_or(0, |b| b.len())).sum();
+            if held + incoming > Self::CACHE_CAP_BYTES {
+                c.clear();
+            }
+            c.insert(addr, stored);
+        }
     }
 
     /// Write data under a logical **string** key. Hashes the key to a 32-byte vault address (so the string never reaches disk), then delegates to [`write_addr`](Self::write_addr). For callers whose key is genuinely a string (table/pk/seq, e.g. rārangi). Callers that already hold a 32-byte address (a seed, a conversation id) should use [`write_addr`](Self::write_addr) directly rather than text-encoding it first.
@@ -521,6 +539,8 @@ impl FlatStorage {
         } else {
             data.to_vec()
         };
+        // Cache BEFORE posting: read-your-own-writes — a reader racing this write sees the value about to become durable instead of stalling behind the commit.
+        self.cache_put(*addr, Some(stored.clone()));
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Put { addr: *addr, stored, reply }, reply_rx)?
             .map_err(StorageError::Vault)
@@ -529,10 +549,19 @@ impl FlatStorage {
     /// Read the value at a 32-byte vault **address**. Returns `None` if absent. Every block on the path is hash-verified by manifestus.
     /// Reads jump the librarian's queued writes (see [`librarian`]), so this waits for at most one in-flight write — never a persist burst. Decrypt runs on the caller's thread.
     pub fn read_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        let stored = self
-            .post(VaultOp::Get { addr: *addr, reply }, reply_rx)?
-            .map_err(StorageError::Vault)?;
+        // Cache first — a hit never touches the librarian, so no read waits behind a running commit (the 2026-08-21 hitches). Decrypt still runs per read; RAM holds only stored bytes.
+        let cached = self.read_cache.lock().ok().and_then(|c| c.get(addr).cloned());
+        let stored = match cached {
+            Some(hit) => hit,
+            None => {
+                let (reply, reply_rx) = std::sync::mpsc::channel();
+                let fetched = self
+                    .post(VaultOp::Get { addr: *addr, reply }, reply_rx)?
+                    .map_err(StorageError::Vault)?;
+                self.cache_put(*addr, fetched.clone());
+                fetched
+            }
+        };
         let Some(stored) = stored else {
             return Ok(None);
         };
@@ -546,6 +575,8 @@ impl FlatStorage {
 
     /// Remove the value at a 32-byte vault **address**. Blocks zeroed on both mirrors immediately; the plow reaps the slots.
     pub fn delete_addr(&self, addr: &[u8; 32]) -> Result<(), StorageError> {
+        // Known-absent in the cache immediately (same read-your-own-writes rule as write_addr).
+        self.cache_put(*addr, None);
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Delete { addr: *addr, reply }, reply_rx)?
             .map_err(StorageError::Vault)
@@ -564,6 +595,7 @@ impl FlatStorage {
         } else {
             data.to_vec()
         };
+        self.cache_put(addr, Some(stored.clone()));
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Put { addr, stored, reply }, reply_rx)?
             .map_err(StorageError::Vault)
@@ -572,10 +604,18 @@ impl FlatStorage {
     /// DEVICE-scope read — see [`write_device`](Self::write_device).
     pub fn read_device(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let addr = self.derive_device_entry_key(key);
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        let stored = self
-            .post(VaultOp::Get { addr, reply }, reply_rx)?
-            .map_err(StorageError::Vault)?;
+        let cached = self.read_cache.lock().ok().and_then(|c| c.get(&addr).cloned());
+        let stored = match cached {
+            Some(hit) => hit,
+            None => {
+                let (reply, reply_rx) = std::sync::mpsc::channel();
+                let fetched = self
+                    .post(VaultOp::Get { addr, reply }, reply_rx)?
+                    .map_err(StorageError::Vault)?;
+                self.cache_put(addr, fetched.clone());
+                fetched
+            }
+        };
         let Some(stored) = stored else {
             return Ok(None);
         };
@@ -590,6 +630,7 @@ impl FlatStorage {
     /// DEVICE-scope delete — see [`write_device`](Self::write_device).
     pub fn delete_device(&self, key: &str) -> Result<(), StorageError> {
         let addr = self.derive_device_entry_key(key);
+        self.cache_put(addr, None);
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Delete { addr, reply }, reply_rx)?
             .map_err(StorageError::Vault)
@@ -618,6 +659,7 @@ impl FlatStorage {
 
     /// Write raw STORED bytes at an address — no encrypt, the value is already sealed by its source vault. Migration-only counterpart of [`read_stored`](Self::read_stored); durable on return.
     pub fn write_stored(&self, addr: &[u8; 32], stored: &[u8]) -> Result<(), StorageError> {
+        self.cache_put(*addr, Some(stored.to_vec()));
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Put { addr: *addr, stored: stored.to_vec(), reply }, reply_rx)?
             .map_err(StorageError::Vault)
