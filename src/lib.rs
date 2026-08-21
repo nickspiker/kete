@@ -202,10 +202,29 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
         }
         match mutation {
             Some(VaultOp::Put { addr, stored, reply }) => {
-                let _ = reply.send(put_growing(&mut vault, &addr, &stored));
+                // Slow-op probe: every vault caller BLOCKS on the librarian's reply, so one slow put (BTRFS fsync under IO load) freezes every thread that touches the vault for its whole duration — the process-wide 4-6s silences in the 2026-08-21 field logs end on persist lines, and this line either convicts or clears the vault for them.
+                let t = std::time::Instant::now();
+                let n = stored.len();
+                let r = put_growing(&mut vault, &addr, &stored);
+                let ms = t.elapsed().as_millis();
+                if ms > 200 {
+                    log::warn!(
+                        "kete: SLOW put — {} bytes in {}ms at addr {:02x}{:02x}{:02x}{:02x} (every vault caller blocked behind it)",
+                        n,
+                        ms,
+                        addr[0], addr[1], addr[2], addr[3]
+                    );
+                }
+                let _ = reply.send(r);
             }
             Some(VaultOp::Delete { addr, reply }) => {
-                let _ = reply.send(vault.delete(&addr, unix_now()).map(|_| ()).map_err(|e| e.to_string()));
+                let t = std::time::Instant::now();
+                let r = vault.delete(&addr, unix_now()).map(|_| ()).map_err(|e| e.to_string());
+                let ms = t.elapsed().as_millis();
+                if ms > 200 {
+                    log::warn!("kete: SLOW delete — {}ms at addr {:02x}{:02x}{:02x}{:02x}", ms, addr[0], addr[1], addr[2], addr[3]);
+                }
+                let _ = reply.send(r);
             }
             _ => {}
         }
