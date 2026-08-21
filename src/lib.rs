@@ -202,20 +202,46 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
         }
         match mutation {
             Some(VaultOp::Put { addr, stored, reply }) => {
-                // Slow-op probe: every vault caller BLOCKS on the librarian's reply, so one slow put (BTRFS fsync under IO load) freezes every thread that touches the vault for its whole duration — the process-wide 4-6s silences in the 2026-08-21 field logs end on persist lines, and this line either convicts or clears the vault for them.
+                // GROUP COMMIT: gather every CONSECUTIVE queued put behind this one into a single vault.put_batch — one spine commit/flush for the whole burst. The field conviction (2026-08-21): the commit's flush costs ~900ms per op SIZE-INDEPENDENT on a busy BTRFS desktop, and every vault caller blocks on this thread's reply — so a burst of five per-op commits was a 4.5s process-wide freeze; batched it is one ~900ms window. Stop at the first non-put so reads/deletes keep their queue position; cap the batch so a runaway writer can't defer replies unboundedly.
+                const MAX_BATCH: usize = 64;
+                let mut batch: Vec<([u8; 32], Vec<u8>, std::sync::mpsc::Sender<Result<(), String>>)> =
+                    vec![(addr, stored, reply)];
+                while batch.len() < MAX_BATCH {
+                    match pending.front() {
+                        Some(VaultOp::Put { .. }) => {
+                            let Some(VaultOp::Put { addr, stored, reply }) = pending.pop_front() else { unreachable!() };
+                            batch.push((addr, stored, reply));
+                        }
+                        _ => break,
+                    }
+                }
+                // Late arrivals join too — they were headed for the very next loop pass anyway, and each one caught here is one fewer full commit.
+                while batch.len() < MAX_BATCH {
+                    match rx.try_recv() {
+                        Ok(VaultOp::Put { addr, stored, reply }) => batch.push((addr, stored, reply)),
+                        Ok(other) => {
+                            pending.push_back(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Slow-op probe: every vault caller BLOCKS on the librarian's reply, so one slow commit freezes every vault-touching thread for its duration — this line keeps the field measurement honest post-batching.
                 let t = std::time::Instant::now();
-                let n = stored.len();
-                let r = put_growing(&mut vault, &addr, &stored);
+                let total: usize = batch.iter().map(|(_, s, _)| s.len()).sum();
+                let r = put_growing_batch(&mut vault, &batch);
                 let ms = t.elapsed().as_millis();
                 if ms > 200 {
                     log::warn!(
-                        "kete: SLOW put — {} bytes in {}ms at addr {:02x}{:02x}{:02x}{:02x} (every vault caller blocked behind it)",
-                        n,
-                        ms,
-                        addr[0], addr[1], addr[2], addr[3]
+                        "kete: SLOW put batch — {} op(s), {} bytes in {}ms (every vault caller blocked behind it)",
+                        batch.len(),
+                        total,
+                        ms
                     );
                 }
-                let _ = reply.send(r);
+                for (_, _, reply) in batch {
+                    let _ = reply.send(r.clone());
+                }
             }
             Some(VaultOp::Delete { addr, reply }) => {
                 let t = std::time::Instant::now();
@@ -260,6 +286,50 @@ fn put_growing(
     // Doubling LOOPS as the backstop (fragmentation can defeat the estimate): one doubling covered settings-sized writes, but a big blob legitimately needs several. Bounded — 40 doublings from any sane start exceeds every real disk, so hitting the bound means a growth bug, not a big value.
     for _ in 0..40 {
         match vault.put(addr, stored, unix_now()) {
+            Err(manifestus::Error::TractFull) => {
+                let target = vault.tract_blocks().saturating_mul(2);
+                log::info!(
+                    "kete: tract full of live data — growing {} -> {} blocks",
+                    vault.tract_blocks(),
+                    target
+                );
+                vault
+                    .grow(target, unix_now())
+                    .map_err(|e| format!("vault grow: {e}"))?;
+            }
+            r => return r.map_err(|e| e.to_string()),
+        }
+    }
+    Err("vault grow loop exhausted — growth is not sticking".to_string())
+}
+
+/// [`put_growing`]'s batch shape: pre-size for the burst's TOTAL bytes, then `put_batch` — one spine commit for the whole burst (the group-commit half of the 2026-08-21 ~900ms-per-op fix; the librarian gathers the burst). Same doubling backstop on TractFull.
+fn put_growing_batch(
+    vault: &mut Vault<FileDev, FileDev>,
+    items: &[([u8; 32], Vec<u8>, std::sync::mpsc::Sender<Result<(), String>>)],
+) -> Result<(), String> {
+    const EST_PAYLOAD_PER_BLOCK: u64 = 3072;
+    let total: u64 = items.iter().map(|(_, s, _)| s.len() as u64).sum();
+    let needed = (total / EST_PAYLOAD_PER_BLOCK) + 64;
+    let floor = vault.live_blocks() as u64 + needed;
+    let mut target = vault.tract_blocks();
+    while target < floor {
+        target = target.saturating_mul(2);
+    }
+    if target > vault.tract_blocks() {
+        log::info!(
+            "kete: pre-sizing tract for a {}-byte batch — growing {} -> {} blocks",
+            total,
+            vault.tract_blocks(),
+            target
+        );
+        vault
+            .grow(target, unix_now())
+            .map_err(|e| format!("vault grow: {e}"))?;
+    }
+    let refs: Vec<(&[u8; 32], &[u8])> = items.iter().map(|(a, s, _)| (a, s.as_slice())).collect();
+    for _ in 0..40 {
+        match vault.put_batch(&refs, unix_now()) {
             Err(manifestus::Error::TractFull) => {
                 let target = vault.tract_blocks().saturating_mul(2);
                 log::info!(
