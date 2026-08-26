@@ -292,6 +292,8 @@ pub struct FlatStorage {
     read_cache: Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
     /// Mirrors diverged at open and were replicated back into agreement.
     healed_at_open: bool,
+    /// Values LOST at open by the repair fallback: the strict open refused (torn/reused block behind a committed pointer) and `open_repairing` pruned that many dangling pointers to boot at all. 0 = nothing lost (clean open, or repair found only stale no-data pointers). Callers surface this to the user — a silent prune is how "storage degraded" turns into a mystery.
+    repaired_lost_values: usize,
     /// Whether values are encrypted (per-key ChaCha20-Poly1305) before storage. False = plaintext: the vault still gives integrity + durability (manifestus BLAKE3-seals every block), values are just stored as-is and stay inspectable on disk (e.g. `vsfinfo` on a VSF value). The caller's choice — a plaintext vault is not leaked-file-safe.
     encrypt: bool,
 }
@@ -401,7 +403,14 @@ impl FlatStorage {
         let mut b = FileDev::create(&paths[1], blocks)?;
 
         // Converge divergent mirrors (stale restore, missed writes, fresh second file) BEFORE composing them — block-level, verified, idempotent.
-        let healed = verified_replicate(&mut a, &mut b, HOST_RING_LOG2)?;
+        // The heal is best-effort by definition: its live walk is strict, so a torn block behind a committed pointer aborts it — and that same tear is exactly what the repair-open below survives. A replicate failure must never block boot (field 2026-08-25: it front-ran the open and made the whole vault unbootable).
+        let healed = match verified_replicate(&mut a, &mut b, HOST_RING_LOG2) {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("kete: mirror replicate failed ({e}) — skipping the heal, the open path decides");
+                manifestus::Replicated::default()
+            }
+        };
         let healed_at_open = healed != manifestus::Replicated::default();
         if healed_at_open {
             log::info!(
@@ -411,7 +420,26 @@ impl FlatStorage {
             );
         }
 
-        let vault = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, unix_now())?;
+        // Strict open first; on a refusal whose class the repair walk can survive (a torn or reused block behind a committed pointer — a kill mid-flush, a fence-era relocation gone bad), reopen with the pruning repair instead of leaving the whole vault unbootable. Field 2026-08-25: the Mac's device vault died "seal verification failed" on every boot for half an hour when ONE dangling pointer would have pruned. The repair path commits the pruned index, so the cost is exactly the already-lost values, counted and surfaced — never the vault.
+        let mut repaired_lost_values = 0usize;
+        let vault = match Vault::open(Mirror::new(a, b), HOST_RING_LOG2, unix_now()) {
+            Ok(v) => v,
+            Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
+                log::warn!("kete: vault open refused ({e}) — retrying with the pruning repair open");
+                let a = FileDev::create(&paths[0], blocks)?;
+                let b = FileDev::create(&paths[1], blocks)?;
+                let (v, report) =
+                    Vault::open_repairing(Mirror::new(a, b), HOST_RING_LOG2, unix_now())?;
+                repaired_lost_values = report.dangling.len();
+                log::warn!(
+                    "kete: repair open succeeded — {} stale pointer(s) unlinked, {} dangling pointer(s) pruned (those values are LOST)",
+                    report.stale.len(),
+                    report.dangling.len()
+                );
+                v
+            }
+            Err(e) => return Err(e.into()),
+        };
         // Hand the engine to its librarian — from here on, only that thread touches manifestus.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -425,6 +453,7 @@ impl FlatStorage {
             ops: Mutex::new(tx),
             read_cache: Mutex::new(std::collections::HashMap::new()),
             healed_at_open,
+            repaired_lost_values,
             encrypt,
         })
     }
@@ -605,9 +634,14 @@ impl FlatStorage {
         Ok(addrs.len())
     }
 
+    /// How many values the repair-open fallback pruned to boot this vault (0 = clean open or no data lost). Callers surface a nonzero count — the loss already happened; hiding it is the only way to make it worse.
+    pub fn repaired_lost_values(&self) -> usize {
+        self.repaired_lost_values
+    }
+
     /// True if the mirrors diverged at open (and were healed) or a mirror died mid-session.
     pub fn degraded(&self) -> bool {
-        if self.healed_at_open {
+        if self.healed_at_open || self.repaired_lost_values > 0 {
             return true;
         }
         let (reply, reply_rx) = std::sync::mpsc::channel();
@@ -781,6 +815,50 @@ mod tests {
         let again = device.adopt_all_entries_from(&legacy).unwrap();
         assert_eq!(again, 3);
         assert_eq!(device.read("contacts/index").unwrap(), Some(b"alice,bob".to_vec()));
+    }
+
+    /// Repair-open fallback (field 2026-08-25): a torn/reused block behind a committed pointer made the strict open refuse the WHOLE vault with "seal verification failed" on every boot. The fallback prunes the dangling pointer and boots. Torn = the newest nonzero tract block corrupted in BOTH mirrors (identical tears — a kill mid-flush hits both sides; a one-sided tear is already healed by verified_replicate before this path is reached).
+    #[test]
+    fn torn_live_block_opens_via_repair_fallback() {
+        isolate();
+        let identity = [0xE1u8; 32];
+        let secret = [0xE2u8; 32];
+        {
+            let v = FlatStorage::new(APP, identity, secret).unwrap();
+            for i in 0..6u8 {
+                v.write(&format!("key/{i}"), &[i; 900]).unwrap();
+            }
+        } // librarian + files closed
+
+        let paths = vault_ring_paths(APP, &identity, &secret).unwrap();
+        // The FIRST nonzero block past the ring region is the oldest live VALUE doc (fresh vault, no wrap — values and index versions append in write order, so the lowest tract block is key/0's data, not the index root). Tear its body (past the seal header) in BOTH files: a value tear is surgical, an index-root tear would cost the whole tree.
+        let bytes = std::fs::read(&paths[0]).unwrap();
+        let block = 4096usize;
+        let tract_first = 1usize << HOST_RING_LOG2;
+        let torn = (tract_first..bytes.len() / block)
+            .find(|i| bytes[i * block..(i + 1) * block].iter().any(|b| *b != 0))
+            .expect("a nonzero tract block exists");
+        for p in &paths {
+            use std::io::{Seek, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.seek(std::io::SeekFrom::Start((torn * block + block - 8) as u64)).unwrap();
+            f.write_all(&[0xA5u8; 8]).unwrap();
+        }
+
+        // Reopen: the strict open refuses (Seal), the fallback prunes and boots — and the vault WORKS: fresh writes land, surviving keys read.
+        let v = FlatStorage::new(APP, identity, secret).unwrap();
+        assert!(v.repaired_lost_values() >= 1, "the torn live block must have cost at least one pruned pointer");
+        assert!(v.degraded(), "a repair-open with losses reports degraded");
+        v.write("post-repair", b"alive").unwrap();
+        assert_eq!(v.read("post-repair").unwrap(), Some(b"alive".to_vec()));
+        let mut survivors = 0;
+        for i in 0..6u8 {
+            if let Ok(Some(val)) = v.read(&format!("key/{i}")) {
+                assert_eq!(val, vec![i; 900]);
+                survivors += 1;
+            }
+        }
+        assert!(survivors >= 1, "pruning is surgical — the tear must not take the whole vault");
     }
 
     #[test]
