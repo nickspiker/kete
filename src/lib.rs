@@ -859,6 +859,16 @@ mod tests {
             }
         }
         assert!(survivors >= 1, "pruning is surgical — the tear must not take the whole vault");
+        drop(v);
+
+        // THE REPAIR MUST STICK (field 2026-08-25): the Mac re-pruned the SAME 84 danglings on every boot — the repair commit was a no-op on disk, so the vault re-repaired forever and every mid-session put kept failing. A second reopen must be CLEAN.
+        let v2 = FlatStorage::new(APP, identity, secret).unwrap();
+        assert_eq!(
+            v2.repaired_lost_values(),
+            0,
+            "the pruned index must be durable — a second boot needing the same repair means the repair never landed"
+        );
+        assert_eq!(v2.read("post-repair").unwrap(), Some(b"alive".to_vec()));
     }
 
     #[test]
