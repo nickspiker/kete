@@ -882,8 +882,7 @@ mod tests {
         assert!(decrypt_bytes(&blob, &[8u8; 32]).is_err()); // wrong key fails the AEAD tag
     }
 
-    /// A value sealed under the LEGACY ChaCha20-Poly1305 (12-byte nonce) format must still open — the
-    /// read-both migration path. Synthesizes a legacy blob directly (the old encrypt is gone).
+    /// A value sealed under the LEGACY ChaCha20-Poly1305 (12-byte nonce) format must still open — the read-both migration path. Synthesizes a legacy blob directly (the old encrypt is gone).
     #[test]
     fn decrypts_legacy_12byte_nonce_format() {
         use chacha20poly1305::{ChaCha20Poly1305, Nonce};
