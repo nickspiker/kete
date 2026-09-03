@@ -155,6 +155,11 @@ enum VaultOp {
         addr: [u8; 32],
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    /// Many put-or-delete ops from ONE caller, applied in order under (usually) one manifestus commit — the transaction shape rārangi's transact posts so its apply phase stops paying one commit per write. `Some(stored)` = put (already encrypted by the caller), `None` = delete.
+    Batch {
+        items: Vec<([u8; 32], Option<Vec<u8>>)>,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     Degraded {
         reply: std::sync::mpsc::Sender<bool>,
     },
@@ -181,8 +186,9 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
         while let Ok(op) = rx.try_recv() {
             pending.push_back(op);
         }
-        // Answer every queued read (their mutual order preserved), then perform ONE mutation and re-drain — a read arriving mid-write jumps every still-queued write.
-        let mut mutation: Option<VaultOp> = None;
+        // Answer every queued read (their mutual order preserved), then GATHER every queued mutation into one ordered batch and land it under (usually) one commit. GROUP COMMIT, SAFE FORM (2026-09-02; the 2026-08-21 revert's homework got done in manifestus): the reverted 1944ebe starved the rollback fence because a batch's appends piled up before ONE commit and the fence only slides on commit — manifestus's put ladder now commits MID-LADDER on Fenced (that IS how the fence rises, vault.rs put_no_commit), so a batch degrades toward commit-per-write under fence pressure and never past it. The batch is drained-and-committed within this cycle, never held open across cycles. The flush is size-independent (~900ms on busy BTRFS, 53 bytes = 22KB), so N ops under one commit turn N flushes into one — the 2026-09-02 field day measured 2-5s PER 322-byte put with every vault caller serialized behind it.
+        let mut batch: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::new();
+        let mut replies: Vec<std::sync::mpsc::Sender<Result<(), String>>> = Vec::new();
         while let Some(op) = pending.pop_front() {
             match op {
                 VaultOp::Get { addr, reply } => {
@@ -194,51 +200,50 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                 VaultOp::Keys { reply } => {
                     let _ = reply.send(vault.live_keys().map_err(|e| e.to_string()));
                 }
-                m => {
-                    mutation = Some(m);
-                    break;
+                VaultOp::Put { addr, stored, reply } => {
+                    batch.push((addr, Some(stored)));
+                    replies.push(reply);
+                }
+                VaultOp::Delete { addr, reply } => {
+                    batch.push((addr, None));
+                    replies.push(reply);
+                }
+                VaultOp::Batch { items, reply } => {
+                    batch.extend(items);
+                    replies.push(reply);
                 }
             }
         }
-        match mutation {
-            Some(VaultOp::Put { addr, stored, reply }) => {
-                // COMMIT-PER-WRITE (group commit REVERTED 2026-08-21): batching N puts under one commit STARVED manifestus's rollback fence — the fence only slides on commit, so an uncommitted burst exhausted it and every persist failed with "rollback fence reached at plow …", which withheld transmit/ACK signals (durable-then-signal), stranded clutch at 11/12, and dropped messages. Correctness beats the latency win; the ~900ms-per-op flush is back on the ticket, to be solved inside manifestus (a batch commit that still slides the fence), not by starving it from kete.
-                let t = std::time::Instant::now();
-                let n = stored.len();
-                let r = put_growing(&mut vault, &addr, &stored);
-                let ms = t.elapsed().as_millis();
-                if ms > 200 {
-                    log::warn!(
-                        "kete: SLOW put — {} bytes in {}ms at addr {:02x}{:02x}{:02x}{:02x} (every vault caller blocked behind it)",
-                        n, ms, addr[0], addr[1], addr[2], addr[3]
-                    );
-                }
-                let _ = reply.send(r);
+        if !batch.is_empty() {
+            let t = std::time::Instant::now();
+            let ops = batch.len();
+            let bytes: usize = batch.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len())).sum();
+            let r = apply_growing(&mut vault, &batch);
+            let ms = t.elapsed().as_millis();
+            if ms > 200 {
+                log::warn!(
+                    "kete: SLOW commit — {} op(s), {} bytes in {}ms (every vault caller blocked behind it)",
+                    ops, bytes, ms
+                );
+            } else if ops > 1 {
+                log::info!("kete: group commit — {} op(s), {} bytes in {}ms", ops, bytes, ms);
             }
-            Some(VaultOp::Delete { addr, reply }) => {
-                let t = std::time::Instant::now();
-                let r = vault.delete(&addr, unix_now()).map(|_| ()).map_err(|e| e.to_string());
-                let ms = t.elapsed().as_millis();
-                if ms > 200 {
-                    log::warn!("kete: SLOW delete — {}ms at addr {:02x}{:02x}{:02x}{:02x}", ms, addr[0], addr[1], addr[2], addr[3]);
-                }
-                let _ = reply.send(r);
+            // One shared verdict: the batch is one commit, so its ops share one fate. A per-op verdict would be a lie — a mid-ladder heartbeat may have landed a prefix early, but "early" is still durable, and an error means the caller must treat its op as unwritten either way.
+            for reply in replies {
+                let _ = reply.send(r.clone());
             }
-            _ => {}
         }
     }
 }
 
-/// Put with the designed-but-never-wired growth path: manifestus's put already runs the plow before conceding, so TractFull means the tract is genuinely full of LIVE data — double it (fallocate + commit, fence-conservative per `Vault::grow`) and retry once. Doubling amortizes: a vault that filled once will fill again.
-/// This was the missing link behind photon's 2026-08-16 field failure: a 16MB-initial vault filled and every settings/phonebook/zoom persist died with "tract full" — 304 dropped writes in one session log — because nothing ever called grow.
-fn put_growing(
+/// Growth-aware batch apply (subsumed the old single-op `put_growing` when the librarian went batch-only): pre-size once for the batch's SUMMED payload, then land the whole ordered op list via `apply_batch` (one commit, mixed puts+deletes), doubling thru TractFull with the same bounded backstop. Order is preserved end to end — callers whose last op is their cleanup edge (rārangi's WAL retire) rely on it.
+fn apply_growing(
     vault: &mut Vault<FileDev, FileDev>,
-    addr: &[u8; 32],
-    stored: &[u8],
+    items: &[([u8; 32], Option<Vec<u8>>)],
 ) -> Result<(), String> {
-    // PRE-SIZE for big values: a put discovers TractFull only after writing blocks up to the wall, so growing by failed-pass doubling on a 500MB value re-writes hundreds of wasted MB per rung (measured 78s for a 500MB store). Estimate the block need conservatively (payload ≈ 3.8KB/block; use 3KB so we over-grow, never under) and grow ONCE before the first attempt.
     const EST_PAYLOAD_PER_BLOCK: u64 = 3072;
-    let needed = (stored.len() as u64 / EST_PAYLOAD_PER_BLOCK) + 64;
+    let total: u64 = items.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len() as u64)).sum();
+    let needed = (total / EST_PAYLOAD_PER_BLOCK) + 64;
     let floor = vault.live_blocks() as u64 + needed;
     let mut target = vault.tract_blocks();
     while target < floor {
@@ -246,8 +251,8 @@ fn put_growing(
     }
     if target > vault.tract_blocks() {
         log::info!(
-            "kete: pre-sizing tract for a {}-byte value — growing {} -> {} blocks",
-            stored.len(),
+            "kete: pre-sizing tract for a {}-byte batch — growing {} -> {} blocks",
+            total,
             vault.tract_blocks(),
             target
         );
@@ -255,13 +260,16 @@ fn put_growing(
             .grow(target, unix_now())
             .map_err(|e| format!("vault grow: {e}"))?;
     }
-    // Doubling LOOPS as the backstop (fragmentation can defeat the estimate): one doubling covered settings-sized writes, but a big blob legitimately needs several. Bounded — 40 doublings from any sane start exceeds every real disk, so hitting the bound means a growth bug, not a big value.
+    let refs: Vec<(&[u8; 32], Option<&[u8]>)> = items
+        .iter()
+        .map(|(a, v)| (a, v.as_deref()))
+        .collect();
     for _ in 0..40 {
-        match vault.put(addr, stored, unix_now()) {
+        match vault.apply_batch(&refs, unix_now()) {
             Err(manifestus::Error::TractFull) => {
                 let target = vault.tract_blocks().saturating_mul(2);
                 log::info!(
-                    "kete: tract full of live data — growing {} -> {} blocks",
+                    "kete: tract full of live data — growing {} -> {} blocks (batch)",
                     vault.tract_blocks(),
                     target
                 );
@@ -272,7 +280,7 @@ fn put_growing(
             r => return r.map_err(|e| e.to_string()),
         }
     }
-    Err("vault grow loop exhausted — growth is not sticking".to_string())
+    Err("vault grow loop exhausted — growth is not sticking (batch)".to_string())
 }
 
 // ============================================================================ FlatStorage ================================================================
@@ -537,6 +545,43 @@ impl FlatStorage {
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Delete { addr: *addr, reply }, reply_rx)?
             .map_err(StorageError::Vault)
+    }
+
+    /// Apply MANY put-or-delete addr ops IN ORDER as one librarian batch — (usually) ONE manifestus commit for the lot, instead of one durable round-trip per op. `Some(data)` = put, `None` = delete. This is the transaction shape for rārangi's transact: its apply phase [row puts + catalog + superroot + WAL retire] rode 4-5 serial commits per row before this (the 2026-09-02 field day's 40s message sends); posted as one Batch it is one flush. Encrypt runs on the caller's thread per the write_addr law; every entry hits the read cache before posting (read-your-own-writes). Durable on return. NOT all-or-nothing under fence pressure (a heartbeat commit can land a prefix early — never out of order); callers needing atomicity anchor on their own journal, exactly as rārangi's WAL does.
+    pub fn apply_addr_batch(
+        &self,
+        items: Vec<([u8; 32], Option<Vec<u8>>)>,
+    ) -> Result<(), StorageError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut stored_items: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::with_capacity(items.len());
+        for (addr, value) in items {
+            match value {
+                Some(data) => {
+                    let stored = if self.encrypt {
+                        encrypt_bytes(&data, &self.derive_enc_key_for_addr(&addr)?)
+                            .map_err(StorageError::Crypto)?
+                    } else {
+                        data
+                    };
+                    self.cache_put(addr, Some(stored.clone()));
+                    stored_items.push((addr, Some(stored)));
+                }
+                None => {
+                    self.cache_put(addr, None);
+                    stored_items.push((addr, None));
+                }
+            }
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Batch { items: stored_items, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
+    /// The 32-byte vault address a logical **string** key maps to — for callers (rārangi) that batch string-keyed and addr-keyed ops thru [`apply_addr_batch`](Self::apply_addr_batch) and need the derivation without a write.
+    pub fn entry_addr(&self, key: &str) -> [u8; 32] {
+        self.derive_entry_key(key)
     }
 
     /// This vault's identity seed — callers use it as the `scope` for self/global entries. Panics only if called on a device vault before [`set_identity`](Self::set_identity); legacy per-identity vaults always carry it. New code should prefer [`identity()`](Self::identity).
@@ -910,6 +955,37 @@ mod tests {
         assert_eq!(store.read("k").unwrap().as_deref(), Some(&b"updated"[..]));
         store.delete("k").unwrap();
         assert!(store.read("k").unwrap().is_none());
+    }
+
+    /// The batch API: mixed puts+deletes land in order thru one librarian post, read back correctly (thru the cache AND cold from disk), and entry_addr matches the string-key derivation so batched string ops hit the same rows as write/read.
+    #[test]
+    fn addr_batch_round_trip_and_entry_addr_parity() {
+        isolate();
+        let seed = [0x2Bu8; 32];
+        let secret = [7u8; 32];
+        {
+            let store = FlatStorage::new(APP, seed, secret).unwrap();
+            store.write("doomed", b"to-be-batch-deleted").unwrap();
+            let a1 = store.entry_addr("row/one");
+            let a2 = store.entry_addr("row/two");
+            let doomed = store.entry_addr("doomed");
+            store
+                .apply_addr_batch(vec![
+                    (a1, Some(b"first".to_vec())),
+                    (doomed, None),
+                    (a2, Some(b"second".to_vec())),
+                ])
+                .unwrap();
+            // entry_addr parity: the string-key read path resolves the batched addr write.
+            assert_eq!(store.read("row/one").unwrap().as_deref(), Some(&b"first"[..]));
+            assert_eq!(store.read("row/two").unwrap().as_deref(), Some(&b"second"[..]));
+            assert!(store.read("doomed").unwrap().is_none(), "batched delete landed");
+        }
+        // Cold reopen: the batch was durable, not a cache artifact.
+        let store = FlatStorage::new(APP, seed, secret).unwrap();
+        assert_eq!(store.read("row/one").unwrap().as_deref(), Some(&b"first"[..]));
+        assert_eq!(store.read("row/two").unwrap().as_deref(), Some(&b"second"[..]));
+        assert!(store.read("doomed").unwrap().is_none());
     }
 
     #[test]
