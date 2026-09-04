@@ -430,20 +430,34 @@ impl FlatStorage {
 
         // Strict open first; on a refusal whose class the repair walk can survive (a torn or reused block behind a committed pointer — a kill mid-flush, a fence-era relocation gone bad), reopen with the pruning repair instead of leaving the whole vault unbootable. Field 2026-08-25: the Mac's device vault died "seal verification failed" on every boot for half an hour when ONE dangling pointer would have pruned. The repair path commits the pruned index, so the cost is exactly the already-lost values, counted and surfaced — never the vault.
         let mut repaired_lost_values = 0usize;
-        let vault = match Vault::open(Mirror::new(a, b), HOST_RING_LOG2, unix_now()) {
+        let vault = match Vault::open(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now()) {
             Ok(v) => v,
             Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
                 log::warn!("kete: vault open refused ({e}) — retrying with the pruning repair open");
                 let a = FileDev::create(&paths[0], blocks)?;
                 let b = FileDev::create(&paths[1], blocks)?;
                 let (v, report) =
-                    Vault::open_repairing(Mirror::new(a, b), HOST_RING_LOG2, unix_now())?;
+                    Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now())?;
                 repaired_lost_values = report.dangling.len();
                 log::warn!(
                     "kete: repair open succeeded — {} stale pointer(s) unlinked, {} dangling pointer(s) pruned (those values are LOST)",
                     report.stale.len(),
                     report.dangling.len()
                 );
+                // NAME EVERY LOSS (field 2026-09-03, Leviathan: 43 pruned pointers whose identities were gone forever the moment this log line printed only a count). lba + hash + key + reason is the entire forensic record of what died — without it there is no way to even say WHICH conversations lost rows.
+                for d in &report.dangling {
+                    log::warn!(
+                        "kete: pruned dangling — lba {} hash {} key {} route {}: {}",
+                        d.lba,
+                        hex_prefix(&d.hash),
+                        d.key.as_ref().map_or("?".to_string(), |k| hex_prefix(k)),
+                        hex_prefix(&d.route),
+                        d.reason
+                    );
+                }
+                for s in &report.stale {
+                    log::info!("kete: unlinked stale — lba {} hash {} route {} (fast-deleted, no data behind it)", s.lba, hex_prefix(&s.hash), hex_prefix(&s.route));
+                }
                 v
             }
             Err(e) => return Err(e.into()),
@@ -798,6 +812,27 @@ fn vault_paths(dir: &str, filename: &str) -> Result<[PathBuf; 2], StorageError> 
         };
 
         Ok([primary, shadow])
+    }
+}
+
+/// First 8 bytes of a 32-byte identifier as lowercase hex — enough to correlate across logs without dumping whole hashes.
+fn hex_prefix(bytes: &[u8; 32]) -> String {
+    bytes[..8].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The engine's event sink, routed to the log — closes manifestus's "emit-site wiring is the follow-up pass" TODO for the host profile. Every survivable engine event (verify retries, mirror degradation, averted live-laps) becomes a visible log line instead of dying in the NullSink.
+struct LogSink;
+
+impl manifestus::EventSink for LogSink {
+    fn emit(&mut self, event: manifestus::StorageEvent) {
+        match event {
+            // The lap guard fired: an append was about to destroy a block the committed index still references. The value survived — but the clean invariant was broken upstream, and every one of these is a would-have-been dangling pointer (Leviathan's 43, 2026-09-03). LOUD.
+            manifestus::StorageEvent::LiveLapAverted { lba } => {
+                log::error!("kete: LIVE-LAP AVERTED at lba {} — an append targeted a referenced block and was refused; the value survives, but the clean invariant was broken upstream (report this log)", lba)
+            }
+            manifestus::StorageEvent::MirrorDegraded => log::warn!("kete: mirror degraded — secondary dropped for the session, running unmirrored"),
+            other => log::info!("kete: storage event {:?}", other),
+        }
     }
 }
 
