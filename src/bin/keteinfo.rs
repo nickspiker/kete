@@ -195,7 +195,7 @@ fn main() -> ExitCode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        Vault::open(Mirror::new(a, b), HOST_RING_LOG2, now).map_err(|e| e.to_string())
+        Vault::open(Mirror::new(a, b), HOST_RING_LOG2, now, manifestus::DeletePolicy::UnlinkOnly).map_err(|e| e.to_string())
     })();
     let mut vault = match vault {
         Ok(v) => v,

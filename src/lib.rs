@@ -430,14 +430,15 @@ impl FlatStorage {
 
         // Strict open first; on a refusal whose class the repair walk can survive (a torn or reused block behind a committed pointer — a kill mid-flush, a fence-era relocation gone bad), reopen with the pruning repair instead of leaving the whole vault unbootable. Field 2026-08-25: the Mac's device vault died "seal verification failed" on every boot for half an hour when ONE dangling pointer would have pruned. The repair path commits the pruned index, so the cost is exactly the already-lost values, counted and surfaced — never the vault.
         let mut repaired_lost_values = 0usize;
-        let vault = match Vault::open(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now()) {
+        // UnlinkOnly (see manifestus::DeletePolicy): kete's host profile runs on files over CoW filesystems and vendor-FTL flash — delete is space reclamation, the boot-gated vault key is the security boundary. The ZeroIsErase arm belongs to a future kete-on-owned-NAND profile (ferros on hardware we command), which must choose it consciously at ITS open site.
+        let vault = match Vault::open(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now(), manifestus::DeletePolicy::UnlinkOnly) {
             Ok(v) => v,
             Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
                 log::warn!("kete: vault open refused ({e}) — retrying with the pruning repair open");
                 let a = FileDev::create(&paths[0], blocks)?;
                 let b = FileDev::create(&paths[1], blocks)?;
                 let (v, report) =
-                    Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now())?;
+                    Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now(), manifestus::DeletePolicy::UnlinkOnly)?;
                 repaired_lost_values = report.dangling.len();
                 log::warn!(
                     "kete: repair open succeeded — {} stale pointer(s) unlinked, {} dangling pointer(s) pruned (those values are LOST)",
