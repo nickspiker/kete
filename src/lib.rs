@@ -167,6 +167,10 @@ enum VaultOp {
     Keys {
         reply: std::sync::mpsc::Sender<Result<Vec<[u8; 32]>, String>>,
     },
+    /// The engine's physique (generation, tract occupancy, live set) — display-grade, answered from RAM.
+    Stats {
+        reply: std::sync::mpsc::Sender<manifestus::VaultStats>,
+    },
 }
 
 /// The librarian: the ONE thread that owns the manifestus engine — no mutex exists, so a blocked reader is structurally impossible rather than a per-call-site discipline.
@@ -199,6 +203,9 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                 }
                 VaultOp::Keys { reply } => {
                     let _ = reply.send(vault.live_keys().map_err(|e| e.to_string()));
+                }
+                VaultOp::Stats { reply } => {
+                    let _ = reply.send(vault.engine_stats());
                 }
                 VaultOp::Put { addr, stored, reply } => {
                     batch.push((addr, Some(stored)));
@@ -665,6 +672,12 @@ impl FlatStorage {
     pub fn live_addrs(&self) -> Result<Vec<[u8; 32]>, StorageError> {
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Keys { reply }, reply_rx)?.map_err(StorageError::Vault)
+    }
+
+    /// The engine's physique — one librarian message, answered from RAM (the Settings vault page's read).
+    pub fn vault_stats(&self) -> Result<manifestus::VaultStats, StorageError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Stats { reply }, reply_rx)
     }
 
     /// The raw STORED bytes at an address — ciphertext and all, no decrypt. Migration-only: entry keys derive from (app, addr, scope secrets), not from which vault file holds the value, so stored bytes copied to the same address in another vault with the same secrets decrypt identically.
