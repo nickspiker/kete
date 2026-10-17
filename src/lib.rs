@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
 use chacha20poly1305::{
-    ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
+    XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
 use manifestus::{FileDev, Mirror, Vault, HOST_RING_LOG2, verified_replicate};
@@ -109,9 +109,7 @@ pub fn derive_addr_key(app_id: &str, addr: &[u8; 32], vault_seed: &[u8; 32], sec
     blake3::derive_key(&format!("{}.storage.encryption.v0", app_id), &context)
 }
 
-/// Decrypt a blob produced by [`encrypt_bytes`]. Reads the current XChaCha20-Poly1305 (24-byte nonce) format first, then falls back to the legacy ChaCha20-Poly1305 (12-byte nonce) format for values written before the 2026-08-18 migration. The Poly1305 tag is the disambiguator — a wrong-width attempt fails authentication (2^-128 spurious-pass), so no version byte is needed; a value re-writes into the new format on its next `write`. AEAD failure under BOTH formats (wrong key, tamper, truncation) flows thru as a stringified error.
-///
-/// MIGRATION: drop the legacy branch once every fleet vault has been fully rewritten (a few versions out) — the birthday-bound-erasing 24-byte nonce is the only format we mint now.
+/// Decrypt a blob produced by [`encrypt_bytes`]: XChaCha20-Poly1305, [nonce:24][ct+tag]. The pre-2026-08-18 12-byte-nonce ChaCha reader was dropped 2026-10-17 (Nick: "Ditch the old!") - a value still in that form fails like any undecryptable entry, and the fleet copy replaces it.
 pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     // Current: XChaCha20-Poly1305, [nonce:24][ct+tag].
     if blob.len() >= 24 + 16 {
@@ -122,20 +120,10 @@ pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
             }
         }
     }
-    // Legacy: ChaCha20-Poly1305, [nonce:12][ct+tag].
-    if blob.len() >= 12 + 16 {
-        let (nonce_bytes, ciphertext) = blob.split_at(12);
-        if let Ok(nonce) = Nonce::try_from(nonce_bytes) {
-            if let Ok(pt) = ChaCha20Poly1305::new(key.into()).decrypt(&nonce, ciphertext) {
-                return Ok(pt);
-            }
-        }
-        return Err("decrypt failed under both XChaCha and legacy ChaCha formats".to_string());
+    if blob.len() < 24 + 16 {
+        return Err(format!("ciphertext too short: {} bytes (need ≥ 40 for a nonce + tag)", blob.len()));
     }
-    Err(format!(
-        "ciphertext too short: {} bytes (need ≥ 28 for a legacy nonce + tag)",
-        blob.len()
-    ))
+    Err("decrypt failed (XChaCha20-Poly1305)".to_string())
 }
 
 // ============================================================================ The librarian ==============================================================
@@ -297,7 +285,7 @@ fn apply_growing(
 pub struct FlatStorage {
     /// `App::id` — feeds `vault_path_name` and the per-key KDF context strings.
     app_id: String,
-    /// The IDENTITY seed, when one exists. Legacy per-identity vaults carry it from construction; a device-first vault (open_device*) starts None and gains it via [`set_identity`](Self::set_identity) at attest — Nick's key model 2026-08-20: entries are keyed hash(thing|device) pre-attest and hash(thing|device|person) after.
+    /// The IDENTITY seed, when one exists. Per-identity vaults (`new`) carry it from construction; a device-first vault (open_device*) starts None and gains it via [`set_identity`](Self::set_identity) at attest — Nick's key model 2026-08-20: entries are keyed hash(thing|device) pre-attest and hash(thing|device|person) after.
     identity: Mutex<Option<[u8; 32]>>,
     /// The 32-byte secret the vault is bound to — mixed into both the vault filename and every per-key encryption key. `tohu::device::device_secret()` locks the vault to this machine; any portable secret (passphrase-derived, identity key) makes a vault that opens on any machine holding that secret.
     secret: [u8; 32],
@@ -665,10 +653,9 @@ impl FlatStorage {
         blake3::derive_key(&format!("{}.storage.entry.device.v1", self.app_id), key.as_bytes())
     }
 
-    // ======================================================================== Migration (enumeration + raw copy) =====================================
+    // ======================================================================== Enumeration + raw reads =====================================
 
     /// Every live entry ADDRESS in the vault, enumerated from the committed trie — complete by construction (manifestus leaves carry their keys), zero domain knowledge needed.
-    /// This is the migration walk: `for addr in old.live_addrs() { new.write_stored(&addr, old.read_stored(&addr)) }` moves a whole vault verbatim.
     pub fn live_addrs(&self) -> Result<Vec<[u8; 32]>, StorageError> {
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Keys { reply }, reply_rx)?.map_err(StorageError::Vault)
@@ -680,31 +667,11 @@ impl FlatStorage {
         self.post(VaultOp::Stats { reply }, reply_rx)
     }
 
-    /// The raw STORED bytes at an address — ciphertext and all, no decrypt. Migration-only: entry keys derive from (app, addr, scope secrets), not from which vault file holds the value, so stored bytes copied to the same address in another vault with the same secrets decrypt identically.
+    /// The raw STORED bytes at an address — ciphertext and all, no decrypt: a presence probe that needs no key (photon's blob checks).
     pub fn read_stored(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.post(VaultOp::Get { addr: *addr, reply }, reply_rx)?
             .map_err(StorageError::Vault)
-    }
-
-    /// Write raw STORED bytes at an address — no encrypt, the value is already sealed by its source vault. Migration-only counterpart of [`read_stored`](Self::read_stored); durable on return.
-    pub fn write_stored(&self, addr: &[u8; 32], stored: &[u8]) -> Result<(), StorageError> {
-        self.cache_put(*addr, Some(stored.to_vec()));
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Put { addr: *addr, stored: stored.to_vec(), reply }, reply_rx)?
-            .map_err(StorageError::Vault)
-    }
-
-    /// Copy EVERY live entry of `source` into this vault, stored-bytes verbatim at the same addresses. Returns the entry count. The no-data-loss migration primitive: complete by construction (trie enumeration), idempotent (same addr + same bytes = overwrite with itself).
-    pub fn adopt_all_entries_from(&self, source: &FlatStorage) -> Result<usize, StorageError> {
-        let addrs = source.live_addrs()?;
-        for addr in &addrs {
-            let Some(stored) = source.read_stored(addr)? else {
-                continue; // deleted between enumeration and read — nothing to carry
-            };
-            self.write_stored(addr, &stored)?;
-        }
-        Ok(addrs.len())
     }
 
     /// How many values the repair-open fallback pruned to boot this vault (0 = clean open or no data lost). Callers surface a nonzero count — the loss already happened; hiding it is the only way to make it worse.
@@ -723,7 +690,7 @@ impl FlatStorage {
 
     // ======================================================================== Internal key derivation ================================================
 
-    /// Per-address AEAD key, IDENTITY scope: hash(thing|person|device) — the exact derivation legacy per-identity vaults used, so migrated values decrypt unchanged. Errors when no identity is set (pre-attest): identity-scope data cannot exist before an identity does.
+    /// Per-address AEAD key, IDENTITY scope: hash(thing|person|device). Errors when no identity is set (pre-attest): identity-scope data cannot exist before an identity does.
     fn derive_enc_key_for_addr(&self, addr: &[u8; 32]) -> Result<[u8; 32], StorageError> {
         let identity = self.identity().ok_or_else(|| {
             StorageError::Crypto("identity not set — pre-attest entries use the *_device methods".to_string())
@@ -880,37 +847,6 @@ mod tests {
         );
     }
 
-    /// THE migration contract: a legacy per-identity vault's entries, raw-copied thru live_addrs/read_stored/write_stored into a device-first vault, decrypt identically once set_identity lands — string keys, addr entries, and the sprawl-absorbing device scope all coexisting.
-    #[test]
-    fn adopt_all_entries_migrates_legacy_vault_verbatim() {
-        isolate();
-        let identity = [0xD7u8; 32];
-        let secret = [0xD8u8; 32];
-        let legacy = FlatStorage::new(APP, identity, secret).unwrap();
-        legacy.write("contacts/index", b"alice,bob").unwrap();
-        legacy.write("chains/head", b"generation-9").unwrap();
-        let addr = [0xA5u8; 32];
-        legacy.write_addr(&addr, b"avatar-bytes").unwrap();
-
-        let device = FlatStorage::open_device_shared(APP, secret).unwrap();
-        device.write_device("binding/marker", b"pre-attest-survives").unwrap();
-        let carried = device.adopt_all_entries_from(&legacy).unwrap();
-        assert_eq!(carried, 3, "trie enumeration finds every legacy entry");
-
-        // Pre-identity the ciphertexts are present but unreadable — identity-scope keys don't exist yet.
-        assert!(device.read("contacts/index").is_err());
-        device.set_identity(identity).unwrap();
-        assert_eq!(device.read("contacts/index").unwrap(), Some(b"alice,bob".to_vec()));
-        assert_eq!(device.read("chains/head").unwrap(), Some(b"generation-9".to_vec()));
-        assert_eq!(device.read_addr(&addr).unwrap(), Some(b"avatar-bytes".to_vec()));
-        assert_eq!(device.read_device("binding/marker").unwrap(), Some(b"pre-attest-survives".to_vec()));
-
-        // Idempotent: a re-run (crash-between-marker-and-copy insurance) changes nothing.
-        let again = device.adopt_all_entries_from(&legacy).unwrap();
-        assert_eq!(again, 3);
-        assert_eq!(device.read("contacts/index").unwrap(), Some(b"alice,bob".to_vec()));
-    }
-
     /// Repair-open fallback (field 2026-08-25): a torn/reused block behind a committed pointer made the strict open refuse the WHOLE vault with "seal verification failed" on every boot. The fallback prunes the dangling pointer and boots. Torn = the newest nonzero tract block corrupted in BOTH mirrors (identical tears — a kill mid-flush hits both sides; a one-sided tear is already healed by verified_replicate before this path is reached).
     #[test]
     fn torn_live_block_opens_via_repair_fallback() {
@@ -976,9 +912,9 @@ mod tests {
         assert!(decrypt_bytes(&blob, &[8u8; 32]).is_err()); // wrong key fails the AEAD tag
     }
 
-    /// A value sealed under the LEGACY ChaCha20-Poly1305 (12-byte nonce) format must still open — the read-both migration path. Synthesizes a legacy blob directly (the old encrypt is gone).
+    /// A value sealed under the pre-2026-08-18 ChaCha20-Poly1305 (12-byte nonce) format no longer opens: the read-both reader was dropped.
     #[test]
-    fn decrypts_legacy_12byte_nonce_format() {
+    fn refuses_legacy_12byte_nonce_format() {
         use chacha20poly1305::{ChaCha20Poly1305, Nonce};
         let key = [7u8; 32];
         let pt = b"a pre-migration vault value";
@@ -988,9 +924,8 @@ mod tests {
             .unwrap();
         let mut legacy = nonce_bytes.to_vec();
         legacy.extend_from_slice(&ct);
-        assert_eq!(decrypt_bytes(&legacy, &key).unwrap(), pt);
-        // And the wrong key still fails under the legacy branch too.
-        assert!(decrypt_bytes(&legacy, &[1u8; 32]).is_err());
+        // The reader is gone (2026-10-17): the right key, the old format — refused, never a second parser.
+        assert!(decrypt_bytes(&legacy, &key).is_err());
     }
 
     #[test]
