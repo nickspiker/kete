@@ -643,6 +643,32 @@ impl FlatStorage {
         Ok(Some(plaintext))
     }
 
+    /// DEVICE-scope read by ADDRESS (from [`live_addrs`](Self::live_addrs)): the value decrypted as a device-scope entry, for an app taking stock of what its vault holds when it no longer knows every key (Mahere 2026-10-19). An identity-scope value at that address does not decrypt and reads as an error.
+    pub fn read_device_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        let stored = self.post(VaultOp::Get { addr: *addr, reply }, reply_rx)?.map_err(StorageError::Vault)?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if !self.encrypt {
+            return Ok(Some(stored));
+        }
+        decrypt_bytes(&stored, &self.derive_device_enc_key_for_addr(addr)).map(Some).map_err(StorageError::Crypto)
+    }
+
+    /// Delete MANY values by ADDRESS as one librarian batch (usually one commit): [`delete_device_batch`](Self::delete_device_batch) for addresses found by [`live_addrs`](Self::live_addrs) rather than by key.
+    pub fn delete_addr_batch(&self, addrs: &[[u8; 32]]) -> Result<(), StorageError> {
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        for a in addrs {
+            self.cache_put(*a, None);
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Batch { items: addrs.iter().map(|a| (*a, None)).collect(), reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
     /// DEVICE-scope delete — see [`write_device`](Self::write_device).
     pub fn delete_device(&self, key: &str) -> Result<(), StorageError> {
         let addr = self.derive_device_entry_key(key);
@@ -1092,6 +1118,26 @@ mod tests {
         let v = FlatStorage::open_device_shared(APP, dev).unwrap();
         assert!((0..30).all(|i| v.read_device(&format!("cell {i}")).unwrap().is_none()));
         assert!((30..40).all(|i| v.read_device(&format!("cell {i}")).unwrap().is_some()));
+    }
+
+    /// Every live address reads back as its device-scope value, and a batch delete by address removes exactly those.
+    #[test]
+    fn device_values_by_address() {
+        isolate();
+        let v = FlatStorage::open_device_shared(APP, [0x4du8; 32]).unwrap();
+        for i in 0..12 {
+            v.write_device(&format!("entry {i}"), &[i as u8; 50]).unwrap();
+        }
+        let addrs = v.live_addrs().unwrap();
+        assert_eq!(addrs.len(), 12);
+        let mut seen: Vec<u8> = addrs.iter().map(|a| v.read_device_addr(a).unwrap().unwrap()[0]).collect();
+        seen.sort();
+        assert_eq!(seen, (0..12).collect::<Vec<u8>>());
+        let odd: Vec<[u8; 32]> = addrs.iter().copied().filter(|a| v.read_device_addr(a).unwrap().unwrap()[0] % 2 == 1).collect();
+        v.delete_addr_batch(&odd).unwrap();
+        assert_eq!(v.live_addrs().unwrap().len(), 6);
+        assert!(v.read_device("entry 3").unwrap().is_none());
+        assert!(v.read_device("entry 4").unwrap().is_some());
     }
 
     #[test]
