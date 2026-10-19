@@ -652,6 +652,22 @@ impl FlatStorage {
             .map_err(StorageError::Vault)
     }
 
+    /// DEVICE-scope delete of MANY keys as one librarian batch — (usually) one manifestus commit for the lot instead of one durable round trip per key (Mahere 2026-10-18: moving its cell cache, hundreds of thousands of entries, out of the vault). An absent key is a no-op, as for [`delete_device`](Self::delete_device). Durable on return.
+    pub fn delete_device_batch(&self, keys: &[String]) -> Result<(), StorageError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let addr = self.derive_device_entry_key(key);
+            self.cache_put(addr, None);
+            items.push((addr, None));
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Batch { items, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
     /// Device-scope entry ADDRESS — a distinct context from the identity-scope entry address, so the two scopes can never collide on a storage slot even for an identical logical key.
     fn derive_device_entry_key(&self, key: &str) -> [u8; 32] {
         blake3::derive_key(&format!("{}.storage.entry.device.v1", self.app_id), key.as_bytes())
@@ -1056,6 +1072,26 @@ mod tests {
         v.write_device("contacts", b"device-side").unwrap();
         assert_eq!(v.read("contacts").unwrap().as_deref(), Some(&b"alice"[..]));
         assert_eq!(v.read_device("contacts").unwrap().as_deref(), Some(&b"device-side"[..]));
+    }
+
+    /// A batch of device-scope deletes removes every key it names, leaves the rest, takes absent keys in stride, and holds across a reopen.
+    #[test]
+    fn device_batch_delete() {
+        isolate();
+        let dev = [0x5au8; 32];
+        {
+            let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+            for i in 0..40 {
+                v.write_device(&format!("cell {i}"), &[i as u8; 300]).unwrap();
+            }
+            let gone: Vec<String> = (0..30).map(|i| format!("cell {i}")).chain(["never written".to_string()]).collect();
+            v.delete_device_batch(&gone).unwrap();
+            assert!(v.read_device("cell 0").unwrap().is_none());
+            assert_eq!(v.read_device("cell 35").unwrap().as_deref(), Some(&[35u8; 300][..]));
+        }
+        let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+        assert!((0..30).all(|i| v.read_device(&format!("cell {i}")).unwrap().is_none()));
+        assert!((30..40).all(|i| v.read_device(&format!("cell {i}")).unwrap().is_some()));
     }
 
     #[test]
