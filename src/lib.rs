@@ -402,6 +402,7 @@ impl FlatStorage {
             }
         }
         let blocks = (1u64 << HOST_RING_LOG2) + INITIAL_TRACT_BLOCKS;
+        let opened = std::time::Instant::now();
         let mut a = FileDev::create(&paths[0], blocks)?;
         let mut b = FileDev::create(&paths[1], blocks)?;
 
@@ -415,6 +416,7 @@ impl FlatStorage {
             }
         };
         let healed_at_open = healed != manifestus::Replicated::default();
+        let replicated_ms = opened.elapsed().as_millis();
         if healed_at_open {
             log::info!(
                 "kete: mirrors diverged at open — replicated {} spine + {} tract blocks",
@@ -458,6 +460,8 @@ impl FlatStorage {
             }
             Err(e) => return Err(e.into()),
         };
+        // What an open costs, by part: the mirrors' resync, then the engine's own open (its index walk).
+        log::info!("kete: vault open in {} ms ({} ms resyncing the mirrors{})", opened.elapsed().as_millis(), replicated_ms, if healed_at_open { ", which had diverged" } else { "" });
         // Hand the engine to its librarian — from here on, only that thread touches manifestus.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
