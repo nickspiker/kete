@@ -137,7 +137,13 @@ enum VaultOp {
     Put {
         addr: [u8; 32],
         stored: Vec<u8>,
+        /// A CACHE value (manifestus's cache class): something the app can fetch again, which the vault evicts instead of growing for.
+        cache: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// The cache allowance in blocks (see [`FlatStorage::set_cache_budget`]).
+    CacheBudget {
+        blocks: u64,
     },
     Delete {
         addr: [u8; 32],
@@ -181,6 +187,9 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
         // Answer every queued read (their mutual order preserved), then GATHER every queued mutation into one ordered batch and land it under (usually) one commit. GROUP COMMIT, SAFE FORM (2026-09-02; the 2026-08-21 revert's homework got done in manifestus): the reverted 1944ebe starved the rollback fence because a batch's appends piled up before ONE commit and the fence only slides on commit — manifestus's put ladder now commits MID-LADDER on Fenced (that IS how the fence rises, vault.rs put_no_commit), so a batch degrades toward commit-per-write under fence pressure and never past it. The batch is drained-and-committed within this cycle, never held open across cycles. The flush is size-independent (~900ms on busy BTRFS, 53 bytes = 22KB), so N ops under one commit turn N flushes into one — the 2026-09-02 field day measured 2-5s PER 322-byte put with every vault caller serialized behind it.
         let mut batch: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::new();
         let mut replies: Vec<std::sync::mpsc::Sender<Result<(), String>>> = Vec::new();
+        // Cache values land as their own batch: they never pre-size the tract (the vault evicts cache instead of growing for it).
+        let mut cached: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        let mut cache_replies: Vec<std::sync::mpsc::Sender<Result<(), String>>> = Vec::new();
         while let Some(op) = pending.pop_front() {
             match op {
                 VaultOp::Get { addr, reply } => {
@@ -195,10 +204,15 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                 VaultOp::Stats { reply } => {
                     let _ = reply.send(vault.engine_stats());
                 }
-                VaultOp::Put { addr, stored, reply } => {
+                VaultOp::Put { addr, stored, cache: false, reply } => {
                     batch.push((addr, Some(stored)));
                     replies.push(reply);
                 }
+                VaultOp::Put { addr, stored, cache: true, reply } => {
+                    cached.push((addr, stored));
+                    cache_replies.push(reply);
+                }
+                VaultOp::CacheBudget { blocks } => vault.set_cache_budget(blocks),
                 VaultOp::Delete { addr, reply } => {
                     batch.push((addr, None));
                     replies.push(reply);
@@ -207,6 +221,19 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                     batch.extend(items);
                     replies.push(reply);
                 }
+            }
+        }
+        if !cached.is_empty() {
+            let refs: Vec<(&[u8; 32], &[u8])> = cached.iter().map(|(a, v)| (a, v.as_slice())).collect();
+            let mut r = vault.put_batch_cached(&refs, unix_now());
+            // A cache batch bigger than the whole tract can still meet TractFull: grow once and land it.
+            if let Err(manifestus::Error::TractFull) = r {
+                let target = vault.tract_blocks().saturating_mul(2);
+                r = vault.grow(target, unix_now()).and_then(|_| vault.put_batch_cached(&refs, unix_now()));
+            }
+            let r = r.map_err(|e| e.to_string());
+            for reply in cache_replies {
+                let _ = reply.send(r.clone());
             }
         }
         if !batch.is_empty() {
@@ -229,6 +256,10 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
             }
             // The batch's callers are answered; reclaim belongs here, between batches, not inside the next caller's commit.
             reclaim_while_idle(&mut vault, &rx, &mut pending);
+        }
+        // Still idle: one bounded step of the scrub, which checks both mirrors and heals whichever side has rotted.
+        if pending.is_empty() {
+            scrub_while_idle(&mut vault, &rx, &mut pending);
         }
     }
 }
@@ -278,6 +309,39 @@ fn reclaim_while_idle(
     }
 }
 
+/// THE SCRUB AT THE IDLE EDGE (2026-10-22): a few bounded steps of manifestus's scrub while the mailbox stays empty — each checks a window of live blocks on both mirrors and heals the bad side from the good. A full lap is many idle stretches; nothing waits on it.
+fn scrub_while_idle(
+    vault: &mut Vault<FileDev, FileDev>,
+    rx: &std::sync::mpsc::Receiver<VaultOp>,
+    pending: &mut std::collections::VecDeque<VaultOp>,
+) {
+    const STEP: u64 = 256;
+    for _ in 0..8 {
+        match rx.try_recv() {
+            Ok(op) => {
+                pending.push_back(op);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        match vault.scrub_step(STEP) {
+            Ok(s) => {
+                if s.repaired > 0 || s.lost > 0 {
+                    log::warn!("kete: scrub healed {} block(s), {} bad on both mirrors", s.repaired, s.lost);
+                }
+                if s.lap_done {
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!("kete: scrub step failed ({e})");
+                return;
+            }
+        }
+    }
+}
+
 /// Growth-aware batch apply (subsumed the old single-op `put_growing` when the librarian went batch-only): pre-size once for the batch's SUMMED payload, then land the whole ordered op list via `apply_batch` (one commit, mixed puts+deletes), doubling thru TractFull with the same bounded backstop. Order is preserved end to end — callers whose last op is their cleanup edge (rārangi's WAL retire) rely on it.
 fn apply_growing(
     vault: &mut Vault<FileDev, FileDev>,
@@ -286,7 +350,8 @@ fn apply_growing(
     const EST_PAYLOAD_PER_BLOCK: u64 = 3072;
     let total: u64 = items.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len() as u64)).sum();
     let needed = (total / EST_PAYLOAD_PER_BLOCK) + 64;
-    let floor = vault.live_blocks() as u64 + needed;
+    // Durable data plus the cache allowance: the cache itself is evicted, never grown for.
+    let floor = vault.growth_live() + needed;
     let mut target = vault.tract_blocks();
     while target < floor {
         target = target.saturating_mul(2);
@@ -507,6 +572,9 @@ impl FlatStorage {
             }
             Err(e) => return Err(e.into()),
         };
+        // The lazy second copy: a commit waits for the primary's flush alone; the second ring is written behind it in order, and the next open copies its tail if a kill left it behind.
+        let mut vault = vault;
+        vault.follow();
         // What an open costs, by part: the mirrors' resync, then the engine's own open (its index walk).
         log::info!("kete: vault open in {} ms ({} ms resyncing the mirrors{})", opened.elapsed().as_millis(), replicated_ms, if healed_at_open { ", which had diverged" } else { "" });
         // Hand the engine to its librarian — from here on, only that thread touches manifestus.
@@ -560,6 +628,15 @@ impl FlatStorage {
     /// Write data at a caller-supplied 32-byte vault **address**. For callers who already hold the address as bytes (an identity seed, a conversation id) — no text-encoding round-trip. Encrypts with the per-address ChaCha20-Poly1305 key; durable on return (a spine generation references the new state on at least one verified mirror). The address is the AEAD key input, so a value written here reads back identically whether reached via this method or via [`write`](Self::write) with a string that hashes to the same address.
     /// Encrypt runs HERE on the caller's thread — the librarian only does vault IO, so a big value's AEAD work never delays anyone else's op.
     pub fn write_addr(&self, addr: &[u8; 32], data: &[u8]) -> Result<(), StorageError> {
+        self.write_addr_classed(addr, data, false)
+    }
+
+    /// [`write_addr`](Self::write_addr) for a CACHE value — one the app can fetch again (a public map cell). It reads back like any other until the vault evicts it to make room; it never makes the vault grow past the cache allowance ([`set_cache_budget`](Self::set_cache_budget)).
+    pub fn write_addr_cache(&self, addr: &[u8; 32], data: &[u8]) -> Result<(), StorageError> {
+        self.write_addr_classed(addr, data, true)
+    }
+
+    fn write_addr_classed(&self, addr: &[u8; 32], data: &[u8], cache: bool) -> Result<(), StorageError> {
         let stored = if self.encrypt {
             encrypt_bytes(data, &self.derive_enc_key_for_addr(addr)?).map_err(StorageError::Crypto)?
         } else {
@@ -568,7 +645,7 @@ impl FlatStorage {
         // Cache BEFORE posting: read-your-own-writes — a reader racing this write sees the value about to become durable instead of stalling behind the commit.
         self.cache_put(*addr, Some(stored.clone()));
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Put { addr: *addr, stored, reply }, reply_rx)?
+        self.post(VaultOp::Put { addr: *addr, stored, cache, reply }, reply_rx)?
             .map_err(StorageError::Vault)
     }
 
@@ -652,6 +729,22 @@ impl FlatStorage {
 
     /// DEVICE-scope string-key ops — readable from first launch, before any identity exists: the pre-attest state (binding marker, boot settings, reboot capsule, opt-in flags) that used to sprawl as loose files.
     pub fn write_device(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.write_device_classed(key, data, false)
+    }
+
+    /// DEVICE-scope [`write_addr_cache`](Self::write_addr_cache): a value the app can fetch again, evicted instead of grown for.
+    pub fn write_device_cache(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.write_device_classed(key, data, true)
+    }
+
+    /// The cache allowance, in bytes: the vault grows for durable data plus this much cache, and evicts cache past it at idle.
+    pub fn set_cache_budget(&self, bytes: u64) {
+        if let Ok(tx) = self.ops.lock() {
+            let _ = tx.send(VaultOp::CacheBudget { blocks: bytes / 4096 });
+        }
+    }
+
+    fn write_device_classed(&self, key: &str, data: &[u8], cache: bool) -> Result<(), StorageError> {
         let addr = self.derive_device_entry_key(key);
         let stored = if self.encrypt {
             encrypt_bytes(data, &self.derive_device_enc_key_for_addr(&addr)).map_err(StorageError::Crypto)?
@@ -660,7 +753,7 @@ impl FlatStorage {
         };
         self.cache_put(addr, Some(stored.clone()));
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Put { addr, stored, reply }, reply_rx)?
+        self.post(VaultOp::Put { addr, stored, cache, reply }, reply_rx)?
             .map_err(StorageError::Vault)
     }
 
@@ -905,6 +998,11 @@ impl manifestus::EventSink for LogSink {
                 log::error!("kete: LIVE-LAP AVERTED at lba {} — an append targeted a referenced block and was refused; the value survives, but the clean invariant was broken upstream (report this log)", lba)
             }
             manifestus::StorageEvent::MirrorDegraded => log::warn!("kete: mirror degraded — secondary dropped for the session, running unmirrored"),
+            manifestus::StorageEvent::TornCommit { generation } => log::warn!("kete: torn commit at generation {generation} (a crash inside its flush) — opened at the generation before it"),
+            manifestus::StorageEvent::ReadRepaired { lba } => log::warn!("kete: block {lba} failed its hash on the primary mirror — served from the secondary and rewritten"),
+            manifestus::StorageEvent::ScrubRepaired { lba, primary } => log::warn!("kete: scrub rewrote block {lba} on the {} mirror", if primary { "primary" } else { "secondary" }),
+            manifestus::StorageEvent::DanglingCut { lba } => log::error!("kete: a put cut an index pointer at block {lba} that was unreadable on both mirrors — the value it named is LOST (report this log)"),
+            manifestus::StorageEvent::LiveMapFallback => log::warn!("kete: the vault's live map did not load — opened by walking the index; the next commit rewrites it"),
             other => log::info!("kete: storage event {:?}", other),
         }
     }
@@ -942,7 +1040,7 @@ mod tests {
 
     /// Repair-open fallback (field 2026-08-25): a torn/reused block behind a committed pointer made the strict open refuse the WHOLE vault with "seal verification failed" on every boot. The fallback prunes the dangling pointer and boots. Torn = the newest nonzero tract block corrupted in BOTH mirrors (identical tears — a kill mid-flush hits both sides; a one-sided tear is already healed by verified_replicate before this path is reached).
     #[test]
-    fn torn_live_block_opens_via_repair_fallback() {
+    fn torn_live_block_costs_only_its_own_value() {
         isolate();
         let identity = [0xE1u8; 32];
         let secret = [0xE2u8; 32];
@@ -968,30 +1066,26 @@ mod tests {
             f.write_all(&[0xA5u8; 8]).unwrap();
         }
 
-        // Reopen: the strict open refuses (Seal), the fallback prunes and boots — and the vault WORKS: fresh writes land, surviving keys read.
+        // Reopen. Since the live map (manifestus 2026-10-22) an open reads a few blocks, never every leaf, so a torn value no longer stops the boot: it surfaces where it is read. The tear is in BOTH mirrors, so there is no good copy to serve — that one key reads as an error, every other key reads whole, writes land, and writing the torn key heals it.
         let v = FlatStorage::new(APP, identity, secret).unwrap();
-        assert!(v.repaired_lost_values() >= 1, "the torn live block must have cost at least one pruned pointer");
-        assert!(v.degraded(), "a repair-open with losses reports degraded");
-        v.write("post-repair", b"alive").unwrap();
-        assert_eq!(v.read("post-repair").unwrap(), Some(b"alive".to_vec()));
-        let mut survivors = 0;
+        assert_eq!(v.repaired_lost_values(), 0, "the open did not need the repair fallback");
+        let mut torn_keys = Vec::new();
         for i in 0..6u8 {
-            if let Ok(Some(val)) = v.read(&format!("key/{i}")) {
-                assert_eq!(val, vec![i; 900]);
-                survivors += 1;
+            match v.read(&format!("key/{i}")) {
+                Ok(Some(val)) => assert_eq!(val, vec![i; 900], "an untouched key reads whole"),
+                Err(_) => torn_keys.push(i),
+                Ok(None) => panic!("key/{i} vanished"),
             }
         }
-        assert!(survivors >= 1, "pruning is surgical — the tear must not take the whole vault");
+        assert_eq!(torn_keys.len(), 1, "the tear costs exactly the one value it hit: {torn_keys:?}");
+        v.write("post-tear", b"alive").unwrap();
+        assert_eq!(v.read("post-tear").unwrap(), Some(b"alive".to_vec()));
+        let healed = format!("key/{}", torn_keys[0]);
+        v.write(&healed, b"rewritten").unwrap();
         drop(v);
-
-        // THE REPAIR MUST STICK (field 2026-08-25): the Mac re-pruned the SAME 84 danglings on every boot — the repair commit was a no-op on disk, so the vault re-repaired forever and every mid-session put kept failing. A second reopen must be CLEAN.
         let v2 = FlatStorage::new(APP, identity, secret).unwrap();
-        assert_eq!(
-            v2.repaired_lost_values(),
-            0,
-            "the pruned index must be durable — a second boot needing the same repair means the repair never landed"
-        );
-        assert_eq!(v2.read("post-repair").unwrap(), Some(b"alive".to_vec()));
+        assert_eq!(v2.read(&healed).unwrap(), Some(b"rewritten".to_vec()), "overwriting the torn key healed it, durably");
+        assert_eq!(v2.read("post-tear").unwrap(), Some(b"alive".to_vec()));
     }
 
     #[test]
