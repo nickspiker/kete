@@ -227,6 +227,53 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
             for reply in replies {
                 let _ = reply.send(r.clone());
             }
+            // The batch's callers are answered; reclaim belongs here, between batches, not inside the next caller's commit.
+            reclaim_while_idle(&mut vault, &rx, &mut pending);
+        }
+    }
+}
+
+/// RECLAIM AT THE IDLE EDGE: after a batch's replies are out, while the mailbox stays empty, step the vault's reap ahead one bounded window at a time.
+/// The edge is the batch completing; the stops are the first queued op (taken into `pending`, served next), the vault saying it is comfortable, or one full lap of the reap cursor in this idle stretch — no timer anywhere.
+/// Field 2026-10-21 (Emma's new phone taking in 256 KiB attachment chunks): with reclaim only inside commits, whichever chunk met the shortage paid the reap, the rescue and the grow — single-op commits of 3.3 s and 5.7 s with every vault caller blocked behind them.
+/// A live-heavy tract (reaping cannot pay its way) grows here instead, ahead of the batch that would otherwise grow inside its own commit.
+fn reclaim_while_idle(
+    vault: &mut Vault<FileDev, FileDev>,
+    rx: &std::sync::mpsc::Receiver<VaultOp>,
+    pending: &mut std::collections::VecDeque<VaultOp>,
+) {
+    let lap_end = vault.engine_stats().reap + vault.tract_blocks();
+    loop {
+        match rx.try_recv() {
+            Ok(op) => {
+                pending.push_back(op);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if vault.engine_stats().reap >= lap_end {
+            return;
+        }
+        match vault.reclaim_ahead(unix_now()) {
+            Ok(manifestus::Reclaim::Reaped) => {}
+            Ok(manifestus::Reclaim::LiveHeavy) => {
+                let target = vault.tract_blocks().saturating_mul(2);
+                log::info!(
+                    "kete: tract live-heavy at the idle edge — growing {} -> {} blocks ahead of the next batch",
+                    vault.tract_blocks(),
+                    target
+                );
+                if let Err(e) = vault.grow(target, unix_now()) {
+                    log::warn!("kete: idle grow failed ({e}) — the next batch's ladder grows instead");
+                }
+                return;
+            }
+            Ok(_) => return,
+            Err(e) => {
+                log::warn!("kete: idle reclaim failed ({e}) — the commit ladders still reclaim inline");
+                return;
+            }
         }
     }
 }
