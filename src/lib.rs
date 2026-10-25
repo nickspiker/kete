@@ -111,19 +111,15 @@ pub fn derive_addr_key(app_id: &str, addr: &[u8; 32], vault_seed: &[u8; 32], sec
 
 /// Decrypt a blob produced by [`encrypt_bytes`]: XChaCha20-Poly1305, [nonce:24][ct+tag]. The pre-2026-08-18 12-byte-nonce ChaCha reader was dropped 2026-10-17 (Nick: "Ditch the old!") - a value still in that form fails like any undecryptable entry, and the fleet copy replaces it.
 pub fn decrypt_bytes(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
-    // Current: XChaCha20-Poly1305, [nonce:24][ct+tag].
-    if blob.len() >= 24 + 16 {
-        let (nonce_bytes, ciphertext) = blob.split_at(24);
-        if let Ok(nonce) = XNonce::try_from(nonce_bytes) {
-            if let Ok(pt) = XChaCha20Poly1305::new(key.into()).decrypt(&nonce, ciphertext) {
-                return Ok(pt);
-            }
-        }
-    }
+    // WHY/PROOF: the blob is read back from the vault file and may be any length — under 24 bytes split_at would panic, and under 40 there is no room for a nonce and a tag.
     if blob.len() < 24 + 16 {
         return Err(format!("ciphertext too short: {} bytes (need ≥ 40 for a nonce + tag)", blob.len()));
     }
-    Err("decrypt failed (XChaCha20-Poly1305)".to_string())
+    let (nonce_bytes, ciphertext) = blob.split_at(24);
+    let nonce = XNonce::try_from(nonce_bytes).expect("split_at(24) gives exactly a 24-byte nonce");
+    XChaCha20Poly1305::new(key.into())
+        .decrypt(&nonce, ciphertext)
+        .map_err(|_| "decrypt failed (XChaCha20-Poly1305)".to_string())
 }
 
 // ============================================================================ The librarian ==============================================================
@@ -258,7 +254,8 @@ fn reclaim_while_idle(
         match vault.reclaim_ahead(unix_now()) {
             Ok(manifestus::Reclaim::Reaped) => {}
             Ok(manifestus::Reclaim::LiveHeavy) => {
-                let target = vault.tract_blocks().saturating_mul(2);
+                // PROOF: a tract counts blocks on a real device, far below 2^63, and manifestus doubles it the same way.
+                let target = vault.tract_blocks() * 2;
                 log::info!(
                     "kete: tract live-heavy at the idle edge — growing {} -> {} blocks ahead of the next batch",
                     vault.tract_blocks(),
@@ -289,7 +286,8 @@ fn apply_growing(
     let floor = vault.live_blocks() as u64 + needed;
     let mut target = vault.tract_blocks();
     while target < floor {
-        target = target.saturating_mul(2);
+        // PROOF: floor is the live blocks plus this batch, far below 2^63, so doubling from a real tract reaches it first.
+        target *= 2;
     }
     if target > vault.tract_blocks() {
         log::info!(
@@ -309,7 +307,8 @@ fn apply_growing(
     for _ in 0..40 {
         match vault.apply_batch(&refs, unix_now()) {
             Err(manifestus::Error::TractFull) => {
-                let target = vault.tract_blocks().saturating_mul(2);
+                // PROOF: a tract counts blocks on a real device, far below 2^63, and manifestus doubles it the same way.
+                let target = vault.tract_blocks() * 2;
                 log::info!(
                     "kete: tract full of live data — growing {} -> {} blocks (batch)",
                     vault.tract_blocks(),
@@ -338,8 +337,8 @@ pub struct FlatStorage {
     secret: [u8; 32],
     /// The librarian's mailbox.
     ops: Mutex<std::sync::mpsc::Sender<VaultOp>>,
-    /// STORED-bytes read cache (ciphertext for encrypted vaults — RAM stays as sealed as disk): reads served from here NEVER touch the librarian, so no read ever waits behind a running commit. The 2026-08-21 field capture showed commits at 1-10s under disk load and every UI hitch was a read stuck behind one (render `pre 3772ms`, conversation-open stalls). Write path inserts BEFORE posting (read-your-own-writes — a racing reader sees the value that is about to be durable); delete removes; `None` caches known-absence so repeated misses skip the round-trip too. Bounded: past CACHE_CAP_BYTES the whole map clears (readers fall thru to the librarian — pure correctness, cold speed).
-    read_cache: Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
+    /// STORED-bytes read cache, sorted by address for binary search (ciphertext for encrypted vaults — RAM stays as sealed as disk): reads served from here NEVER touch the librarian, so no read ever waits behind a running commit. The 2026-08-21 field capture showed commits at 1-10s under disk load and every UI hitch was a read stuck behind one (render `pre 3772ms`, conversation-open stalls). Write path inserts BEFORE posting (read-your-own-writes — a racing reader sees the value that is about to be durable); delete removes; `None` caches known-absence so repeated misses skip the round-trip too. Bounded: past CACHE_CAP_BYTES the whole cache clears (readers fall thru to the librarian — pure correctness, cold speed).
+    read_cache: Mutex<Vec<([u8; 32], Option<Vec<u8>>)>>,
     /// Mirrors diverged at open and were replicated back into agreement.
     healed_at_open: bool,
     /// Values LOST at open by the repair fallback: the strict open refused (torn/reused block behind a committed pointer) and `open_repairing` pruned that many dangling pointers to boot at all. 0 = nothing lost (clean open, or repair found only stale no-data pointers). Callers surface this to the user — a silent prune is how "storage degraded" turns into a mystery.
@@ -520,7 +519,7 @@ impl FlatStorage {
             identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
-            read_cache: Mutex::new(std::collections::HashMap::new()),
+            read_cache: Mutex::new(Vec::new()),
             healed_at_open,
             repaired_lost_values,
             encrypt,
@@ -530,16 +529,24 @@ impl FlatStorage {
     /// Read-cache size ceiling (sum of cached value bytes). The whole vault is tens of MB in practice, so a warm session fits; a bulk-content future (avatars, attachments) hits the cap and clears — correctness never depends on residency.
     const CACHE_CAP_BYTES: usize = 64 * 1024 * 1024;
 
-    /// Insert/replace a cache entry, clearing the whole map first if it would exceed the cap.
+    /// Insert/replace a cache entry, clearing the whole cache first if it would exceed the cap.
     fn cache_put(&self, addr: [u8; 32], stored: Option<Vec<u8>>) {
         if let Ok(mut c) = self.read_cache.lock() {
             let incoming = stored.as_ref().map_or(0, |v| v.len());
-            let held: usize = c.values().map(|v| v.as_ref().map_or(0, |b| b.len())).sum();
+            let held: usize = c.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len())).sum();
             if held + incoming > Self::CACHE_CAP_BYTES {
                 c.clear();
             }
-            c.insert(addr, stored);
+            match c.binary_search_by(|(a, _)| a.cmp(&addr)) {
+                Ok(i) => c[i].1 = stored,
+                Err(i) => c.insert(i, (addr, stored)),
+            }
         }
+    }
+
+    /// The cached stored bytes at `addr` (`Some(None)` = known absent), by binary search over the address-sorted cache.
+    fn cache_get(c: &[([u8; 32], Option<Vec<u8>>)], addr: &[u8; 32]) -> Option<Option<Vec<u8>>> {
+        c.binary_search_by(|(a, _)| a.cmp(addr)).ok().map(|i| c[i].1.clone())
     }
 
     /// Write data under a logical **string** key. Hashes the key to a 32-byte vault address (so the string never reaches disk), then delegates to [`write_addr`](Self::write_addr). For callers whose key is genuinely a string (table/pk/seq, e.g. rārangi). Callers that already hold a 32-byte address (a seed, a conversation id) should use [`write_addr`](Self::write_addr) directly rather than text-encoding it first.
@@ -576,7 +583,7 @@ impl FlatStorage {
     /// Reads jump the librarian's queued writes (see [`librarian`]), so this waits for at most one in-flight write — never a persist burst. Decrypt runs on the caller's thread.
     pub fn read_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         // Cache first — a hit never touches the librarian, so no read waits behind a running commit (the 2026-08-21 hitches). Decrypt still runs per read; RAM holds only stored bytes.
-        let cached = self.read_cache.lock().ok().and_then(|c| c.get(addr).cloned());
+        let cached = self.read_cache.lock().ok().and_then(|c| Self::cache_get(&c, addr));
         let stored = match cached {
             Some(hit) => hit,
             None => {
@@ -667,7 +674,7 @@ impl FlatStorage {
     /// DEVICE-scope read — see [`write_device`](Self::write_device).
     pub fn read_device(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let addr = self.derive_device_entry_key(key);
-        let cached = self.read_cache.lock().ok().and_then(|c| c.get(&addr).cloned());
+        let cached = self.read_cache.lock().ok().and_then(|c| Self::cache_get(&c, &addr));
         let stored = match cached {
             Some(hit) => hit,
             None => {
@@ -1104,7 +1111,7 @@ mod tests {
                 let fat = fat.clone();
                 std::thread::spawn(move || {
                     for i in 0u8..8 {
-                        let addr = [t.wrapping_mul(64).wrapping_add(i); 32];
+                        let addr = [t * 64 + i; 32];
                         let value = if i % 2 == 0 { fat.clone() } else { vec![t, i] };
                         store.write_addr(&addr, &value).unwrap();
                         assert_eq!(store.read_addr(&addr).unwrap().as_deref(), Some(&value[..]));
