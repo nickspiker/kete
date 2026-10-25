@@ -251,7 +251,7 @@ fn reclaim_while_idle(
         if vault.engine_stats().reap >= lap_end {
             return;
         }
-        match vault.reclaim_ahead(unix_now()) {
+        match vault.reclaim_ahead(eagle_now()) {
             Ok(manifestus::Reclaim::Reaped) => {}
             Ok(manifestus::Reclaim::LiveHeavy) => {
                 // PROOF: a tract counts blocks on a real device, far below 2^63, and manifestus doubles it the same way.
@@ -261,7 +261,7 @@ fn reclaim_while_idle(
                     vault.tract_blocks(),
                     target
                 );
-                if let Err(e) = vault.grow(target, unix_now()) {
+                if let Err(e) = vault.grow(target, eagle_now()) {
                     log::warn!("kete: idle grow failed ({e}) — the next batch's ladder grows instead");
                 }
                 return;
@@ -297,7 +297,7 @@ fn apply_growing(
             target
         );
         vault
-            .grow(target, unix_now())
+            .grow(target, eagle_now())
             .map_err(|e| format!("vault grow: {e}"))?;
     }
     let refs: Vec<(&[u8; 32], Option<&[u8]>)> = items
@@ -305,7 +305,7 @@ fn apply_growing(
         .map(|(a, v)| (a, v.as_deref()))
         .collect();
     for _ in 0..40 {
-        match vault.apply_batch(&refs, unix_now()) {
+        match vault.apply_batch(&refs, eagle_now()) {
             Err(manifestus::Error::TractFull) => {
                 // PROOF: a tract counts blocks on a real device, far below 2^63, and manifestus doubles it the same way.
                 let target = vault.tract_blocks() * 2;
@@ -315,7 +315,7 @@ fn apply_growing(
                     target
                 );
                 vault
-                    .grow(target, unix_now())
+                    .grow(target, eagle_now())
                     .map_err(|e| format!("vault grow: {e}"))?;
             }
             r => return r.map_err(|e| e.to_string()),
@@ -474,14 +474,14 @@ impl FlatStorage {
         // Strict open first; on a refusal whose class the repair walk can survive (a torn or reused block behind a committed pointer — a kill mid-flush, a fence-era relocation gone bad), reopen with the pruning repair instead of leaving the whole vault unbootable. Field 2026-08-25: the Mac's device vault died "seal verification failed" on every boot for half an hour when ONE dangling pointer would have pruned. The repair path commits the pruned index, so the cost is exactly the already-lost values, counted and surfaced — never the vault.
         let mut repaired_lost_values = 0usize;
         // UnlinkOnly (see manifestus::DeletePolicy): kete's host profile runs on files over CoW filesystems and vendor-FTL flash — delete is space reclamation, the boot-gated vault key is the security boundary. The ZeroIsErase arm belongs to a future kete-on-owned-NAND profile (ferros on hardware we command), which must choose it consciously at ITS open site.
-        let vault = match Vault::open(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now(), manifestus::DeletePolicy::UnlinkOnly) {
+        let vault = match Vault::open(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly) {
             Ok(v) => v,
             Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
                 log::warn!("kete: vault open refused ({e}) — retrying with the pruning repair open");
                 let a = FileDev::create(&paths[0], blocks)?;
                 let b = FileDev::create(&paths[1], blocks)?;
                 let (v, report) =
-                    Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, unix_now(), manifestus::DeletePolicy::UnlinkOnly)?;
+                    Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly)?;
                 repaired_lost_values = report.dangling.len();
                 log::warn!(
                     "kete: repair open succeeded — {} stale pointer(s) unlinked, {} dangling pointer(s) pruned (those values are LOST)",
@@ -917,12 +917,10 @@ impl manifestus::EventSink for LogSink {
     }
 }
 
-/// Caller-clock timestamp (`now`) for manifestus commit metadata. Unix seconds — manifestus never interprets it; it exists for GC policy and debugging.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// The commit stamp (`now`) manifestus writes into every spine entry as VSF `e6`: Eagle time in oscillations, which is what that type IS.
+/// It was Unix seconds (2026-10-25: every vault commit read as about 1.2 s after the Eagle landed); manifestus only asks that a generation's stamp exceed the head's, and real oscillations (~2.6e18) exceed every Unix second ever stored (~1.7e9), so existing vaults keep that order across the change.
+fn eagle_now() -> i64 {
+    vsf::eagle_time_oscillations()
 }
 
 #[cfg(test)]

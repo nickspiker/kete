@@ -191,10 +191,8 @@ fn main() -> ExitCode {
         let mut a = FileDev::open(&copies[0]).map_err(|e| e.to_string())?;
         let mut b = FileDev::open(&copies[1]).map_err(|e| e.to_string())?;
         verified_replicate(&mut a, &mut b, HOST_RING_LOG2).map_err(|e| e.to_string())?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // Eagle time in oscillations, the VSF e6 manifestus stamps (lib.rs eagle_now).
+        let now = vsf::eagle_time_oscillations();
         Vault::open(Mirror::new(a, b), HOST_RING_LOG2, now, manifestus::DeletePolicy::UnlinkOnly).map_err(|e| e.to_string())
     })();
     let mut vault = match vault {
