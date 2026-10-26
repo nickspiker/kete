@@ -1,6 +1,6 @@
 [package]
 name = "kete"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 rust-version = "1.85"
 description = "Encrypted keyed storage: per-key ChaCha20-Poly1305 over a manifestus vault, addressed and keyed by tohu device identity. The shared storage adapter for the passless app stack (photon, idiosync, ...)."
@@ -20,7 +20,7 @@ path = "src/bin/keteinfo.rs"
 # Storage engine + device identity. `version` is required for crates.io publishing
 # (it uses the registry version; the path is for local development) — keep these in
 # step with the published manifestus/tohu versions.
-manifestus = { version = "0.0.4", path = "../manifestus" }
+manifestus = { version = "0.0.5", path = "../manifestus" }
 tohu = { version = "0.0.3", path = "../tohu" }
 # VSF rendering for keteinfo: a decrypted value that parses as a VSF document prints as one.
 vsf = { version = "0.10", path = "../vsf", features = ["inspect"] }
