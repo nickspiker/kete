@@ -748,6 +748,27 @@ impl FlatStorage {
             .map_err(StorageError::Vault)
     }
 
+    /// DEVICE-scope write of MANY keys as one librarian batch — (usually) one manifestus commit for the lot instead of one durable round trip per key (Mahere 2026-10-25: a view's cells arrive by the hundred). Encrypted on the caller's thread and visible to reads at once, as for [`write_device`](Self::write_device). Durable on return.
+    pub fn write_device_batch(&self, entries: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::with_capacity(entries.len());
+        for (key, data) in entries {
+            let addr = self.derive_device_entry_key(key);
+            let stored = if self.encrypt {
+                encrypt_bytes(data, &self.derive_device_enc_key_for_addr(&addr)).map_err(StorageError::Crypto)?
+            } else {
+                data.clone()
+            };
+            self.cache_put(addr, Some(stored.clone()));
+            items.push((addr, Some(stored)));
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Batch { items, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
     /// Device-scope entry ADDRESS — a distinct context from the identity-scope entry address, so the two scopes can never collide on a storage slot even for an identical logical key.
     fn derive_device_entry_key(&self, key: &str) -> [u8; 32] {
         blake3::derive_key(&format!("{}.storage.entry.device.v1", self.app_id), key.as_bytes())
