@@ -157,18 +157,103 @@ enum VaultOp {
     },
 }
 
+/// What the librarian needs to reopen its vault with the pruning repair open, when a lazy open's walk refuses (see [`FlatStorage::open`]).
+struct Reopen {
+    paths: [PathBuf; 2],
+    blocks: u64,
+    lost: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Reopen {
+    /// The repair open over the same files, its losses named in the log and counted.
+    fn repair(&self, refusal: &manifestus::Error) -> Result<Vault<FileDev, FileDev>, StorageError> {
+        log::warn!("kete: vault open refused ({refusal}) — retrying with the pruning repair open");
+        let a = FileDev::create(&self.paths[0], self.blocks)?;
+        let b = FileDev::create(&self.paths[1], self.blocks)?;
+        let (v, report) = Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly)?;
+        self.lost.fetch_add(report.dangling.len(), std::sync::atomic::Ordering::Relaxed);
+        log::warn!(
+            "kete: repair open succeeded — {} stale pointer(s) unlinked, {} dangling pointer(s) pruned (those values are LOST)",
+            report.stale.len(),
+            report.dangling.len()
+        );
+        // NAME EVERY LOSS (field 2026-09-03, Leviathan: 43 pruned pointers whose identities were gone forever the moment this log line printed only a count). lba + hash + key + reason is the entire forensic record of what died — without it there is no way to even say WHICH conversations lost rows.
+        for d in &report.dangling {
+            log::warn!(
+                "kete: pruned dangling — lba {} hash {} key {} route {}: {}",
+                d.lba,
+                hex_prefix(&d.hash),
+                d.key.as_ref().map_or("?".to_string(), |k| hex_prefix(k)),
+                hex_prefix(&d.route),
+                d.reason
+            );
+        }
+        for s in &report.stale {
+            log::info!("kete: unlinked stale — lba {} hash {} route {} (fast-deleted, no data behind it)", s.lba, hex_prefix(&s.hash), hex_prefix(&s.route));
+        }
+        Ok(v)
+    }
+
+    /// One step of the vault's walk; a refusal the repair walk can survive reopens with it in place. True once settled.
+    fn step(&self, vault: &mut Vault<FileDev, FileDev>) -> Result<bool, String> {
+        match vault.settle_step() {
+            Ok(done) => Ok(done),
+            Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
+                *vault = self.repair(&e).map_err(|e| e.to_string())?;
+                Ok(true)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The walk to its end — what a write, an enumeration of the live set's numbers, waits for.
+    fn settle(&self, vault: &mut Vault<FileDev, FileDev>) -> Result<(), String> {
+        let t = std::time::Instant::now();
+        let was = vault.settled();
+        while !self.step(vault)? {}
+        if !was {
+            log::info!("kete: vault walk finished in {} ms, ahead of a write", t.elapsed().as_millis());
+        }
+        Ok(())
+    }
+}
+
 /// The librarian: the ONE thread that owns the manifestus engine — no mutex exists, so a blocked reader is structurally impossible rather than a per-call-site discipline.
 /// The old shape (engine under a Mutex, every thread calling in) meant an innocent read queued behind whichever persist worker held the lock thru a whole encrypted table write — the 2026-08-15 field lag (400-1794ms UI stalls on a per-tick avatar probe).
 /// Reads go first: before each mutation the mailbox is drained and every queued Get is answered, so a read waits for at most the ONE write already on the platter, never a queue of them. Writes can theoretically starve under a sustained read flood, but read floods are boot-shaped and brief while writes coalesce upstream — the trade is deliberate.
 /// The thread exits when every sender drops (recv errs), dropping the engine; manifestus is crash-safe at any byte boundary, so no explicit flush handshake is needed.
-fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<VaultOp>) {
+/// After a lazy open the walk that finds what is live runs here a step (a thousand index blocks) at a time whenever the mailbox is empty, so reads never wait for it; a write that arrives first finishes it.
+fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<VaultOp>, reopen: Reopen) {
     let mut pending: std::collections::VecDeque<VaultOp> = std::collections::VecDeque::new();
+    let walk_started = std::time::Instant::now();
     loop {
-        // Idle: block for one op. Busy: drain whatever queued while the last op ran.
+        // Idle: a step of the walk while it is unfinished, else block for one op. Busy: drain whatever queued while the last op ran.
         if pending.is_empty() {
-            match rx.recv() {
-                Ok(op) => pending.push_back(op),
-                Err(_) => return,
+            if !vault.settled() {
+                match rx.try_recv() {
+                    Ok(op) => pending.push_back(op),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        match reopen.step(&mut vault) {
+                            Ok(true) => log::info!("kete: vault walk finished {} ms after the open", walk_started.elapsed().as_millis()),
+                            Ok(false) => {}
+                            // Left unsettled: the next write tries again and carries the error to its caller.
+                            Err(e) => {
+                                log::warn!("kete: vault walk failed ({e}) — the next write retries it");
+                                match rx.recv() {
+                                    Ok(op) => pending.push_back(op),
+                                    Err(_) => return,
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                match rx.recv() {
+                    Ok(op) => pending.push_back(op),
+                    Err(_) => return,
+                }
             }
         }
         while let Ok(op) = rx.try_recv() {
@@ -189,6 +274,8 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                     let _ = reply.send(vault.live_keys().map_err(|e| e.to_string()));
                 }
                 VaultOp::Stats { reply } => {
+                    // The live set's numbers are the walk's: finish it (best-effort; an unsettled vault reports what it knows).
+                    let _ = reopen.settle(&mut vault);
                     let _ = reply.send(vault.engine_stats());
                 }
                 VaultOp::Put { addr, stored, reply } => {
@@ -209,7 +296,7 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
             let t = std::time::Instant::now();
             let ops = batch.len();
             let bytes: usize = batch.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len())).sum();
-            let r = apply_growing(&mut vault, &batch);
+            let r = reopen.settle(&mut vault).and_then(|()| apply_growing(&mut vault, &batch));
             let ms = t.elapsed().as_millis();
             if ms > 200 {
                 log::warn!(
@@ -341,8 +428,8 @@ pub struct FlatStorage {
     read_cache: Mutex<Vec<([u8; 32], Option<Vec<u8>>)>>,
     /// Mirrors diverged at open and were replicated back into agreement.
     healed_at_open: bool,
-    /// Values LOST at open by the repair fallback: the strict open refused (torn/reused block behind a committed pointer) and `open_repairing` pruned that many dangling pointers to boot at all. 0 = nothing lost (clean open, or repair found only stale no-data pointers). Callers surface this to the user — a silent prune is how "storage degraded" turns into a mystery.
-    repaired_lost_values: usize,
+    /// Values LOST by the repair fallback: the strict open (or its walk, stepped by the librarian after a lazy open) refused (torn/reused block behind a committed pointer) and `open_repairing` pruned that many dangling pointers to boot at all; counted when the walk meets it, which may be after the open returned. 0 = nothing lost (clean open, or repair found only stale no-data pointers). Callers surface this to the user — a silent prune is how "storage degraded" turns into a mystery.
+    repaired_lost_values: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Whether values are encrypted (per-key ChaCha20-Poly1305) before storage. False = plaintext: the vault still gives integrity + durability (manifestus BLAKE3-seals every block), values are just stored as-is and stay inspectable on disk (e.g. `vsfinfo` on a VSF value). The caller's choice — a plaintext vault is not leaked-file-safe.
     encrypt: bool,
 }
@@ -471,48 +558,22 @@ impl FlatStorage {
             );
         }
 
-        // Strict open first; on a refusal whose class the repair walk can survive (a torn or reused block behind a committed pointer — a kill mid-flush, a fence-era relocation gone bad), reopen with the pruning repair instead of leaving the whole vault unbootable. Field 2026-08-25: the Mac's device vault died "seal verification failed" on every boot for half an hour when ONE dangling pointer would have pruned. The repair path commits the pruned index, so the cost is exactly the already-lost values, counted and surfaced — never the vault.
-        let mut repaired_lost_values = 0usize;
+        // Strict open first, LAZY (2026-10-25): the head is read here and the index walk that finds what is live is stepped on the librarian between requests (see `librarian`), so the open costs the same at any size — the walk read one leaf per entry, 1.3 s at eight thousand on a desktop SSD, before the app's first read. Its refusals (a torn or reused block behind a committed pointer — a kill mid-flush, a fence-era relocation gone bad) now come from the walk, and the librarian meets them with the repair open; one met here takes it at once. Field 2026-08-25: the Mac's device vault died "seal verification failed" on every boot for half an hour when ONE dangling pointer would have pruned. The repair path commits the pruned index, so the cost is exactly the already-lost values, counted and surfaced — never the vault.
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reopen = Reopen { paths: paths.clone(), blocks, lost: lost.clone() };
         // UnlinkOnly (see manifestus::DeletePolicy): kete's host profile runs on files over CoW filesystems and vendor-FTL flash — delete is space reclamation, the boot-gated vault key is the security boundary. The ZeroIsErase arm belongs to a future kete-on-owned-NAND profile (ferros on hardware we command), which must choose it consciously at ITS open site.
-        let vault = match Vault::open(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly) {
+        let vault = match Vault::open_lazy(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly) {
             Ok(v) => v,
-            Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
-                log::warn!("kete: vault open refused ({e}) — retrying with the pruning repair open");
-                let a = FileDev::create(&paths[0], blocks)?;
-                let b = FileDev::create(&paths[1], blocks)?;
-                let (v, report) =
-                    Vault::open_repairing(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly)?;
-                repaired_lost_values = report.dangling.len();
-                log::warn!(
-                    "kete: repair open succeeded — {} stale pointer(s) unlinked, {} dangling pointer(s) pruned (those values are LOST)",
-                    report.stale.len(),
-                    report.dangling.len()
-                );
-                // NAME EVERY LOSS (field 2026-09-03, Leviathan: 43 pruned pointers whose identities were gone forever the moment this log line printed only a count). lba + hash + key + reason is the entire forensic record of what died — without it there is no way to even say WHICH conversations lost rows.
-                for d in &report.dangling {
-                    log::warn!(
-                        "kete: pruned dangling — lba {} hash {} key {} route {}: {}",
-                        d.lba,
-                        hex_prefix(&d.hash),
-                        d.key.as_ref().map_or("?".to_string(), |k| hex_prefix(k)),
-                        hex_prefix(&d.route),
-                        d.reason
-                    );
-                }
-                for s in &report.stale {
-                    log::info!("kete: unlinked stale — lba {} hash {} route {} (fast-deleted, no data behind it)", s.lba, hex_prefix(&s.hash), hex_prefix(&s.route));
-                }
-                v
-            }
+            Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => reopen.repair(&e)?,
             Err(e) => return Err(e.into()),
         };
         // What an open costs, by part: the mirrors' resync, then the engine's own open (its index walk).
-        log::info!("kete: vault open in {} ms ({} ms resyncing the mirrors{})", opened.elapsed().as_millis(), replicated_ms, if healed_at_open { ", which had diverged" } else { "" });
+        log::info!("kete: vault open in {} ms ({} ms resyncing the mirrors{}), its walk to follow between requests", opened.elapsed().as_millis(), replicated_ms, if healed_at_open { ", which had diverged" } else { "" });
         // Hand the engine to its librarian — from here on, only that thread touches manifestus.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("kete-librarian".to_string())
-            .spawn(move || librarian(vault, rx))
+            .spawn(move || librarian(vault, rx, reopen))
             .map_err(|e| StorageError::Io(e))?;
         Ok(Self {
             app_id: app.id.to_string(),
@@ -521,7 +582,7 @@ impl FlatStorage {
             ops: Mutex::new(tx),
             read_cache: Mutex::new(Vec::new()),
             healed_at_open,
-            repaired_lost_values,
+            repaired_lost_values: lost,
             encrypt,
         })
     }
@@ -797,12 +858,12 @@ impl FlatStorage {
 
     /// How many values the repair-open fallback pruned to boot this vault (0 = clean open or no data lost). Callers surface a nonzero count — the loss already happened; hiding it is the only way to make it worse.
     pub fn repaired_lost_values(&self) -> usize {
-        self.repaired_lost_values
+        self.repaired_lost_values.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// True if the mirrors diverged at open (and were healed) or a mirror died mid-session.
     pub fn degraded(&self) -> bool {
-        if self.healed_at_open || self.repaired_lost_values > 0 {
+        if self.healed_at_open || self.repaired_lost_values() > 0 {
             return true;
         }
         let (reply, reply_rx) = std::sync::mpsc::channel();
@@ -994,11 +1055,11 @@ mod tests {
             f.write_all(&[0xA5u8; 8]).unwrap();
         }
 
-        // Reopen: the strict open refuses (Seal), the fallback prunes and boots — and the vault WORKS: fresh writes land, surviving keys read.
+        // Reopen (lazily): the walk refuses (Seal) where it meets the tear — at the latest before the first write lands — the fallback prunes and reopens, and the vault WORKS: fresh writes land, surviving keys read.
         let v = FlatStorage::new(APP, identity, secret).unwrap();
+        v.write("post-repair", b"alive").unwrap();
         assert!(v.repaired_lost_values() >= 1, "the torn live block must have cost at least one pruned pointer");
         assert!(v.degraded(), "a repair-open with losses reports degraded");
-        v.write("post-repair", b"alive").unwrap();
         assert_eq!(v.read("post-repair").unwrap(), Some(b"alive".to_vec()));
         let mut survivors = 0;
         for i in 0..6u8 {
@@ -1012,6 +1073,8 @@ mod tests {
 
         // THE REPAIR MUST STICK (field 2026-08-25): the Mac re-pruned the SAME 84 danglings on every boot — the repair commit was a no-op on disk, so the vault re-repaired forever and every mid-session put kept failing. A second reopen must be CLEAN.
         let v2 = FlatStorage::new(APP, identity, secret).unwrap();
+        // A write finishes the lazy walk: past it, a repair would have been counted.
+        v2.write("second boot", b"clean").unwrap();
         assert_eq!(
             v2.repaired_lost_values(),
             0,
