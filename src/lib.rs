@@ -758,6 +758,54 @@ impl FlatStorage {
         Ok(Some(plaintext))
     }
 
+    /// DEVICE-scope read of a BULK value ([`write_device_bulk`](Self::write_device_bulk)): straight from the librarian, never the read cache, and nothing added to it. A value written through the cache still reads as cached.
+    pub fn read_device_bulk(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let addr = self.derive_device_entry_key(key);
+        let cached = self.read_cache.lock().ok().and_then(|c| Self::cache_get(&c, &addr));
+        let stored = match cached {
+            Some(hit) => hit,
+            None => {
+                let (reply, reply_rx) = std::sync::mpsc::channel();
+                self.post(VaultOp::Get { addr, reply }, reply_rx)?.map_err(StorageError::Vault)?
+            }
+        };
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if !self.encrypt {
+            return Ok(Some(stored));
+        }
+        let plaintext = decrypt_bytes(&stored, &self.derive_device_enc_key_for_addr(&addr)).map_err(StorageError::Crypto)?;
+        Ok(Some(plaintext))
+    }
+
+    /// DEVICE-scope write of many BULK values as one librarian batch, kept OUT of the read cache: values the caller holds itself and reads back rarely (Mahere's downloaded map cells, Nick 2026-10-25), which through the cache would fill it past its cap and clear everyone's entries with it. A cached entry at one of the keys is dropped, never left stale. Durable on return; until then a read may answer from before the write (the librarian answers queued reads first), so a caller that must read its own writes holds them until this returns.
+    pub fn write_device_bulk(&self, entries: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::with_capacity(entries.len());
+        for (key, data) in entries {
+            let addr = self.derive_device_entry_key(key);
+            let stored = if self.encrypt {
+                encrypt_bytes(data, &self.derive_device_enc_key_for_addr(&addr)).map_err(StorageError::Crypto)?
+            } else {
+                data.clone()
+            };
+            items.push((addr, Some(stored)));
+        }
+        if let Ok(mut c) = self.read_cache.lock() {
+            for (addr, _) in &items {
+                if let Ok(i) = c.binary_search_by(|(a, _)| a.cmp(addr)) {
+                    c.remove(i);
+                }
+            }
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Batch { items, reply }, reply_rx)?
+            .map_err(StorageError::Vault)
+    }
+
     /// DEVICE-scope read by ADDRESS (from [`live_addrs`](Self::live_addrs)): the value decrypted as a device-scope entry, for an app taking stock of what its vault holds when it no longer knows every key (Mahere 2026-10-19). An identity-scope value at that address does not decrypt and reads as an error.
     pub fn read_device_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         let (reply, reply_rx) = std::sync::mpsc::channel();
@@ -1254,6 +1302,28 @@ mod tests {
         let v = FlatStorage::open_device_shared(APP, dev).unwrap();
         assert!((0..30).all(|i| v.read_device(&format!("cell {i}")).unwrap().is_none()));
         assert!((30..40).all(|i| v.read_device(&format!("cell {i}")).unwrap().is_some()));
+    }
+
+    /// Bulk values round-trip, hold across a reopen, replace a cached value without leaving it stale, and stay out of the read cache; a batch of ordinary device writes reads back too.
+    #[test]
+    fn device_bulk_and_batch_writes() {
+        isolate();
+        let dev = [0x6bu8; 32];
+        {
+            let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+            v.write_device("setting", b"old").unwrap();
+            v.write_device_batch(&[("a".to_string(), vec![1; 50]), ("b".to_string(), vec![2; 50])]).unwrap();
+            let cells: Vec<(String, Vec<u8>)> = (0..20).map(|i| (format!("cell {i}"), vec![i as u8; 9000])).chain([("setting".to_string(), b"new".to_vec())]).collect();
+            v.write_device_bulk(&cells).unwrap();
+            assert_eq!(v.read_device("setting").unwrap().as_deref(), Some(&b"new"[..]), "a bulk write leaves no stale cached value");
+            assert_eq!(v.read_device_bulk("cell 7").unwrap().as_deref(), Some(&[7u8; 9000][..]));
+            assert_eq!(v.read_device("b").unwrap().as_deref(), Some(&[2u8; 50][..]));
+            let cached: usize = v.read_cache.lock().unwrap().iter().map(|(_, x)| x.as_ref().map_or(0, |b| b.len())).sum();
+            assert!(cached < 9000, "bulk values are not cached ({cached} bytes held)");
+        }
+        let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+        assert!((0..20).all(|i| v.read_device_bulk(&format!("cell {i}")).unwrap().as_deref() == Some(&[i as u8; 9000][..])));
+        assert_eq!(v.read_device("a").unwrap().as_deref(), Some(&[1u8; 50][..]));
     }
 
     /// Every live address reads back as its device-scope value, and a batch delete by address removes exactly those.
