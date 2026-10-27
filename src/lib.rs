@@ -8,6 +8,7 @@
 //!
 //! Crash model (inherited from manifestus): power loss at ANY byte boundary is normal operation. Every block self-validates; the committed generation defines exactly which writes exist; the rollback fence keeps the last 4 generations restorable. Open replicates divergent mirrors block-level (verified, never a file copy) before composing them.
 
+#[cfg(not(target_os = "ferros"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
