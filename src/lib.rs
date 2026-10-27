@@ -15,13 +15,19 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
+#[cfg(not(target_os = "ferros"))]
 use manifestus::{FileDev, Mirror, Vault, HOST_RING_LOG2, verified_replicate};
 use rand::RngCore;
 
+#[cfg(target_os = "ferros")]
+mod ferros;
+
 /// Shadow-ring filename suffix used when XDG config_dir == data_dir (macOS): both rings live in the same directory but with distinct names, keeping the dual-ring invariant intact across platforms.
+#[cfg(not(target_os = "ferros"))]
 const VAULT_SHADOW_SUFFIX: &str = ".shadow";
 
 /// Initial tract size: 4096 blocks = 16MB per mirror file. Deliberately small — a vault starts small and growth is one fallocate + commit.
+#[cfg(not(target_os = "ferros"))]
 const INITIAL_TRACT_BLOCKS: u64 = 4096;
 
 /// Identifies the calling application. `id` feeds the `tohu::vault_path_name` filename and the per-key KDF context strings; `dir` is the XDG subdirectory the dual rings live under. Both are stable per app — changing either orphans that app's existing vaults.
@@ -158,12 +164,14 @@ enum VaultOp {
 }
 
 /// What the librarian needs to reopen its vault with the pruning repair open, when a lazy open's walk refuses (see [`FlatStorage::open`]).
+#[cfg(not(target_os = "ferros"))]
 struct Reopen {
     paths: [PathBuf; 2],
     blocks: u64,
     lost: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[cfg(not(target_os = "ferros"))]
 impl Reopen {
     /// The repair open over the same files, its losses named in the log and counted.
     fn repair(&self, refusal: &manifestus::Error) -> Result<Vault<FileDev, FileDev>, StorageError> {
@@ -223,6 +231,7 @@ impl Reopen {
 /// Reads go first: before each mutation the mailbox is drained and every queued Get is answered, so a read waits for at most the ONE write already on the platter, never a queue of them. Writes can theoretically starve under a sustained read flood, but read floods are boot-shaped and brief while writes coalesce upstream — the trade is deliberate.
 /// The thread exits when every sender drops (recv errs), dropping the engine; manifestus is crash-safe at any byte boundary, so no explicit flush handshake is needed.
 /// After a lazy open the walk that finds what is live runs here a step (a thousand index blocks) at a time whenever the mailbox is empty, so reads never wait for it; a write that arrives first finishes it.
+#[cfg(not(target_os = "ferros"))]
 fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<VaultOp>, reopen: Reopen) {
     let mut pending: std::collections::VecDeque<VaultOp> = std::collections::VecDeque::new();
     let walk_started = std::time::Instant::now();
@@ -320,6 +329,7 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
 /// The edge is the batch completing; the stops are the first queued op (taken into `pending`, served next), the vault saying it is comfortable, or one full lap of the reap cursor in this idle stretch — no timer anywhere.
 /// Field 2026-10-21 (Emma's new phone taking in 256 KiB attachment chunks): with reclaim only inside commits, whichever chunk met the shortage paid the reap, the rescue and the grow — single-op commits of 3.3 s and 5.7 s with every vault caller blocked behind them.
 /// A live-heavy tract (reaping cannot pay its way) grows here instead, ahead of the batch that would otherwise grow inside its own commit.
+#[cfg(not(target_os = "ferros"))]
 fn reclaim_while_idle(
     vault: &mut Vault<FileDev, FileDev>,
     rx: &std::sync::mpsc::Receiver<VaultOp>,
@@ -363,6 +373,7 @@ fn reclaim_while_idle(
 }
 
 /// Growth-aware batch apply (subsumed the old single-op `put_growing` when the librarian went batch-only): pre-size once for the batch's SUMMED payload, then land the whole ordered op list via `apply_batch` (one commit, mixed puts+deletes), doubling thru TractFull with the same bounded backstop. Order is preserved end to end — callers whose last op is their cleanup edge (rārangi's WAL retire) rely on it.
+#[cfg(not(target_os = "ferros"))]
 fn apply_growing(
     vault: &mut Vault<FileDev, FileDev>,
     items: &[([u8; 32], Option<Vec<u8>>)],
@@ -526,6 +537,28 @@ impl FlatStorage {
         self.identity.lock().ok().and_then(|g| *g)
     }
 
+    /// On ferros: this process's vault scope, through the kernel (`ferros.rs`); `filename`, which tells one vault from another on a host, becomes a key prefix inside the scope.
+    #[cfg(target_os = "ferros")]
+    fn open(app: App, filename: String, identity: Option<[u8; 32]>, secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
+        let store = ferros::KernelStore::open(&filename).ok_or_else(|| StorageError::Vault("ferros: this process holds no vault scope (spawn it with --store)".to_string()))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("kete-librarian".to_string())
+            .spawn(move || ferros::librarian(store, rx))
+            .map_err(StorageError::Io)?;
+        Ok(Self {
+            app_id: app.id.to_string(),
+            identity: Mutex::new(identity),
+            secret,
+            ops: Mutex::new(tx),
+            read_cache: Mutex::new(Vec::new()),
+            healed_at_open: false,
+            repaired_lost_values: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            encrypt,
+        })
+    }
+
+    #[cfg(not(target_os = "ferros"))]
     fn open(app: App, filename: String, identity: Option<[u8; 32]>, secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
         let paths = vault_paths(app.dir, &filename)?;
 
@@ -965,11 +998,13 @@ pub fn android_vault_dirs() -> Option<(String, String)> {
 
 /// Resolve the two ring paths for the given per-handle filename. Files live under `<config_dir>/<dir>/<filename>.vsf` and `<data_dir>/<dir>/<filename>.vsf`. On Linux + Windows the XDG split gives different directories. On macOS `config_dir()` and `data_dir()` collide; the shadow then shares the directory with `<filename>.shadow.vsf`. On Android the dirs come from the JNI shim.
 /// The two physical ring-file paths a vault occupies (config-dir + data-dir, or the shadow-suffixed pair when they coincide), for a given app + vault seed + secret. Exposed so inspection tools (`keteinfo`) can open the same files `FlatStorage` would, without re-deriving the (android-vs-desktop, config-vs-data) path logic. Same inputs as [`FlatStorage::new`].
+#[cfg(not(target_os = "ferros"))]
 pub fn vault_ring_paths(app: App, vault_seed: &[u8; 32], secret: &[u8; 32]) -> Result<[PathBuf; 2], StorageError> {
     let filename = tohu::vault_path_name(app.id, vault_seed, secret);
     vault_paths(app.dir, &filename)
 }
 
+#[cfg(not(target_os = "ferros"))]
 fn vault_paths(dir: &str, filename: &str) -> Result<[PathBuf; 2], StorageError> {
     let primary_name = format!("{}.vsf", filename);
     let shadow_name = format!("{}{}.vsf", filename, VAULT_SHADOW_SUFFIX);
@@ -1027,13 +1062,16 @@ fn vault_paths(dir: &str, filename: &str) -> Result<[PathBuf; 2], StorageError> 
 }
 
 /// First 8 bytes of a 32-byte identifier as lowercase hex — enough to correlate across logs without dumping whole hashes.
+#[cfg(not(target_os = "ferros"))]
 fn hex_prefix(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// The engine's event sink, routed to the log — closes manifestus's "emit-site wiring is the follow-up pass" TODO for the host profile. Every survivable engine event (verify retries, mirror degradation, averted live-laps) becomes a visible log line instead of dying in the NullSink.
+#[cfg(not(target_os = "ferros"))]
 struct LogSink;
 
+#[cfg(not(target_os = "ferros"))]
 impl manifestus::EventSink for LogSink {
     fn emit(&mut self, event: manifestus::StorageEvent) {
         match event {
@@ -1049,6 +1087,7 @@ impl manifestus::EventSink for LogSink {
 
 /// The commit stamp (`now`) manifestus writes into every spine entry as VSF `e6`: Eagle time in oscillations, which is what that type IS.
 /// It was Unix seconds (2026-10-25: every vault commit read as about 1.2 s after the Eagle landed); manifestus only asks that a generation's stamp exceed the head's, and real oscillations (~2.6e18) exceed every Unix second ever stored (~1.7e9), so existing vaults keep that order across the change.
+#[cfg(not(target_os = "ferros"))]
 fn eagle_now() -> i64 {
     vsf::eagle_time_oscillations()
 }

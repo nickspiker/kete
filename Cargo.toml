@@ -31,5 +31,8 @@ chacha20poly1305 = "0.11.0-rc.2"
 rand = "0.8"
 
 # Platform dirs + logging facade (replaces photon's internal crate::log).
-dirs = "6.0.0"
 log = "0.4"
+
+# The host vault lives in XDG directories; on ferros there are no directories (src/ferros.rs: the kernel's vault scope).
+[target.'cfg(not(target_os = "ferros"))'.dependencies]
+dirs = "6.0.0"
