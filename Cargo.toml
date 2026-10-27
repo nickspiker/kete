@@ -36,3 +36,7 @@ log = "0.4"
 # The host vault lives in XDG directories; on ferros there are no directories (src/ferros.rs: the kernel's vault scope).
 [target.'cfg(not(target_os = "ferros"))'.dependencies]
 dirs = "6.0.0"
+
+# target_os = "ferros" is the phone as a ferros process (a JSON target, STD-TARGET.md in the ferros repo): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
