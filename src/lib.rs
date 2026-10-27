@@ -537,10 +537,10 @@ impl FlatStorage {
         self.identity.lock().ok().and_then(|g| *g)
     }
 
-    /// On ferros: this process's vault scope, through the kernel (`ferros.rs`); `filename`, which tells one vault from another on a host, becomes a key prefix inside the scope.
+    /// On ferros: this process's vault scope, through the kernel (`ferros.rs`), entries by the addresses kete derives; `filename`, which tells one vault from another on a host, is not needed — the identity and device derivations never meet.
     #[cfg(target_os = "ferros")]
-    fn open(app: App, filename: String, identity: Option<[u8; 32]>, secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
-        let store = ferros::KernelStore::open(&filename).ok_or_else(|| StorageError::Vault("ferros: this process holds no vault scope (spawn it with --store)".to_string()))?;
+    fn open(app: App, _filename: String, identity: Option<[u8; 32]>, secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
+        let store = ferros::KernelStore::open().ok_or_else(|| StorageError::Vault("ferros: this process holds no vault scope (spawn it with --store)".to_string()))?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("kete-librarian".to_string())
