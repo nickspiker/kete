@@ -938,6 +938,70 @@ impl FlatStorage {
             .map_err(StorageError::Vault)
     }
 
+    /// Carry every live entry of this vault into `new`, a vault founded under a different secret, at the SAME addresses.
+    /// Entry addresses never mix the secret in (see `derive_entry_key`), only the value keys do, so each value is opened under this vault's keys and sealed under `new`'s: zero domain knowledge, the old vault untouched.
+    /// Device-scope keys are tried first, then identity-scope ones (both vaults must serve the same identity, or none); a value neither key opens is counted and left behind (a repair-open loss or a retired encoding, which the fleet copy replaces).
+    /// Posted in bounded batches so the librarian commits a bounded amount at a time. ANDROID ROOT CONVERSION PIN, delete at v168: photon moves a vault founded under the ANDROID_ID root onto the Widevine root with this.
+    pub fn rehome_into(&self, new: &FlatStorage) -> Result<Rehomed, StorageError> {
+        if self.identity() != new.identity() {
+            return Err(StorageError::Crypto("re-home: the two vaults serve different identities".to_string()));
+        }
+        if self.encrypt != new.encrypt {
+            return Err(StorageError::Crypto("re-home: one vault is sealed and the other is not".to_string()));
+        }
+        // One librarian batch per this many sealed bytes: a vault of attachments re-homes as a run of bounded commits, never one commit the size of the vault.
+        const BATCH_BYTES: usize = 1 << 24;
+        let mut out = Rehomed::default();
+        let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::new();
+        let mut held = 0usize;
+        for addr in self.live_addrs()? {
+            let Some(stored) = self.read_stored(&addr)? else {
+                continue;
+            };
+            let resealed = if !self.encrypt {
+                out.device += 1;
+                stored
+            } else if let Ok(plain) = decrypt_bytes(&stored, &self.derive_device_enc_key_for_addr(&addr)) {
+                out.device += 1;
+                encrypt_bytes(&plain, &new.derive_device_enc_key_for_addr(&addr)).map_err(StorageError::Crypto)?
+            } else {
+                let opened = self
+                    .derive_enc_key_for_addr(&addr)
+                    .ok()
+                    .and_then(|k| decrypt_bytes(&stored, &k).ok());
+                match opened {
+                    Some(plain) => {
+                        out.identity += 1;
+                        encrypt_bytes(&plain, &new.derive_enc_key_for_addr(&addr)?).map_err(StorageError::Crypto)?
+                    }
+                    None => {
+                        out.unopened += 1;
+                        continue;
+                    }
+                }
+            };
+            held += resealed.len();
+            items.push((addr, Some(resealed)));
+            if held >= BATCH_BYTES {
+                new.post_batch(std::mem::take(&mut items))?;
+                held = 0;
+            }
+        }
+        if !items.is_empty() {
+            new.post_batch(items)?;
+        }
+        Ok(out)
+    }
+
+    /// One librarian batch of already-sealed values, as [`rehome_into`](Self::rehome_into) hands them over.
+    fn post_batch(&self, items: Vec<([u8; 32], Option<Vec<u8>>)>) -> Result<(), StorageError> {
+        if let Ok(mut c) = self.read_cache.lock() {
+            c.clear();
+        }
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post(VaultOp::Batch { items, reply }, reply_rx)?.map_err(StorageError::Vault)
+    }
+
     /// How many values the repair-open fallback pruned to boot this vault (0 = clean open or no data lost). Callers surface a nonzero count — the loss already happened; hiding it is the only way to make it worse.
     pub fn repaired_lost_values(&self) -> usize {
         self.repaired_lost_values.load(std::sync::atomic::Ordering::Relaxed)
@@ -1003,6 +1067,30 @@ pub fn android_vault_dirs() -> Option<(String, String)> {
 pub fn vault_ring_paths(app: App, vault_seed: &[u8; 32], secret: &[u8; 32]) -> Result<[PathBuf; 2], StorageError> {
     let filename = tohu::vault_path_name(app.id, vault_seed, secret);
     vault_paths(app.dir, &filename)
+}
+
+/// What [`FlatStorage::rehome_into`] carried: entries moved as device scope, as identity scope, and left behind because neither key opened them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Rehomed {
+    pub device: usize,
+    pub identity: usize,
+    pub unopened: usize,
+}
+
+/// Remove both ring files of the device vault founded under `device_secret`: the retired vault after a re-home, deleted as the OS deletes (no shred claim). Absent files are not an error.
+/// The caller sees to it that no engine of this process still serves it, or exits right after. ANDROID ROOT CONVERSION PIN, delete at v168.
+#[cfg(not(target_os = "ferros"))]
+pub fn discard_device_vault(app: App, device_secret: &[u8; 32]) -> std::io::Result<()> {
+    let filename = tohu::device_vault_path_name(app.id, device_secret);
+    let paths = vault_paths(app.dir, &filename).map_err(|e| std::io::Error::other(e.to_string()))?;
+    for p in &paths {
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Whether a device vault founded under `device_secret` is on disk (either ring file present), without opening it.
