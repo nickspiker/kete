@@ -1005,6 +1005,17 @@ pub fn vault_ring_paths(app: App, vault_seed: &[u8; 32], secret: &[u8; 32]) -> R
     vault_paths(app.dir, &filename)
 }
 
+/// Whether a device vault founded under `device_secret` is on disk (either ring file present), without opening it.
+/// The app's Android root selection asks this for each candidate root before any derivation, so a vault founded under the old root keeps its root (ANDROID ROOT CONVERSION PIN, delete at v168).
+#[cfg(not(target_os = "ferros"))]
+pub fn device_vault_present(app: App, device_secret: &[u8; 32]) -> bool {
+    let filename = tohu::device_vault_path_name(app.id, device_secret);
+    match vault_paths(app.dir, &filename) {
+        Ok(paths) => paths.iter().any(|p| p.exists()),
+        Err(_) => false,
+    }
+}
+
 #[cfg(not(target_os = "ferros"))]
 fn vault_paths(dir: &str, filename: &str) -> Result<[PathBuf; 2], StorageError> {
     let primary_name = format!("{}.vsf", filename);
