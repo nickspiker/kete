@@ -941,7 +941,7 @@ impl FlatStorage {
     /// Carry every live entry of this vault into `new`, a vault founded under a different secret, at the SAME addresses.
     /// Entry addresses never mix the secret in (see `derive_entry_key`), only the value keys do, so each value is opened under this vault's keys and sealed under `new`'s: zero domain knowledge, the old vault untouched.
     /// Device-scope keys are tried first, then identity-scope ones (both vaults must serve the same identity, or none); a value neither key opens is counted and left behind (a repair-open loss or a retired encoding, which the fleet copy replaces).
-    /// Posted in bounded batches so the librarian commits a bounded amount at a time. ANDROID ROOT CONVERSION PIN, delete not before 2027-02-01: photon moves a vault founded under the ANDROID_ID root onto the Widevine root with this.
+    /// Posted in bounded batches so the librarian commits a bounded amount at a time. ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01: photon moves a vault founded under the ANDROID_ID root onto the Widevine root with this.
     pub fn rehome_into(&self, new: &FlatStorage) -> Result<Rehomed, StorageError> {
         if self.identity() != new.identity() {
             return Err(StorageError::Crypto("re-home: the two vaults serve different identities".to_string()));
@@ -1078,7 +1078,7 @@ pub struct Rehomed {
 }
 
 /// Remove both ring files of the device vault founded under `device_secret`: the retired vault after a re-home, deleted as the OS deletes (no shred claim). Absent files are not an error.
-/// The caller sees to it that no engine of this process still serves it, or exits right after. ANDROID ROOT CONVERSION PIN, delete not before 2027-02-01.
+/// The caller sees to it that no engine of this process still serves it, or exits right after. ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01.
 #[cfg(not(target_os = "ferros"))]
 pub fn discard_device_vault(app: App, device_secret: &[u8; 32]) -> std::io::Result<()> {
     let filename = tohu::device_vault_path_name(app.id, device_secret);
@@ -1094,7 +1094,7 @@ pub fn discard_device_vault(app: App, device_secret: &[u8; 32]) -> std::io::Resu
 }
 
 /// Whether a device vault founded under `device_secret` is on disk (either ring file present), without opening it.
-/// The app's Android root selection asks this for each candidate root before any derivation, so a vault founded under the old root keeps its root (ANDROID ROOT CONVERSION PIN, delete not before 2027-02-01).
+/// The app's Android root selection asks this for each candidate root before any derivation, so a vault founded under the old root keeps its root (ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01).
 #[cfg(not(target_os = "ferros"))]
 pub fn device_vault_present(app: App, device_secret: &[u8; 32]) -> bool {
     let filename = tohu::device_vault_path_name(app.id, device_secret);
