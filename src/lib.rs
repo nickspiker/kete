@@ -203,23 +203,42 @@ impl Reopen {
         Ok(v)
     }
 
-    /// One step of the vault's walk; a refusal the repair walk can survive reopens with it in place. True once settled.
-    fn step(&self, vault: &mut Vault<FileDev, FileDev>) -> Result<bool, String> {
+    /// The lazy open over the same files, as [`FlatStorage::open`] performs it: what the slot is refilled with when a repair open fails, so the engine is never lost.
+    fn lazy(&self) -> Result<Vault<FileDev, FileDev>, StorageError> {
+        let a = FileDev::create(&self.paths[0], self.blocks)?;
+        let b = FileDev::create(&self.paths[1], self.blocks)?;
+        Ok(Vault::open_lazy(Mirror::new(a, b).with_events(Box::new(LogSink)), HOST_RING_LOG2, eagle_now(), manifestus::DeletePolicy::UnlinkOnly)?)
+    }
+
+    /// One step of the vault's walk over the librarian's slot; a refusal the repair walk can survive closes the engine and reopens with the repair open in its place. True once settled.
+    /// The refusing engine is dropped BEFORE the repair open: its files hold the ring's cross-process lock (manifestus LIB-07), and the repair open takes that same lock, so an engine still alive read as "held by another process" (kete's own torn-block test, 2026-11-03).
+    fn step(&self, slot: &mut Option<Vault<FileDev, FileDev>>) -> Result<bool, String> {
+        let vault = slot.as_mut().expect("the librarian's vault is in its slot");
         match vault.settle_step() {
             Ok(done) => Ok(done),
             Err(e @ (manifestus::Error::Seal | manifestus::Error::Corrupt(_))) => {
-                *vault = self.repair(&e).map_err(|e| e.to_string())?;
-                Ok(true)
+                drop(slot.take());
+                match self.repair(&e) {
+                    Ok(v) => {
+                        *slot = Some(v);
+                        Ok(true)
+                    }
+                    Err(repair_err) => {
+                        // The repair refused: the ring is reopened lazily so the engine is not lost, the walk refuses again on the next step, and the error reaches its caller.
+                        *slot = Some(self.lazy().map_err(|e| e.to_string())?);
+                        Err(repair_err.to_string())
+                    }
+                }
             }
             Err(e) => Err(e.to_string()),
         }
     }
 
     /// The walk to its end — what a write, an enumeration of the live set's numbers, waits for.
-    fn settle(&self, vault: &mut Vault<FileDev, FileDev>) -> Result<(), String> {
+    fn settle(&self, slot: &mut Option<Vault<FileDev, FileDev>>) -> Result<(), String> {
         let t = std::time::Instant::now();
-        let was = vault.settled();
-        while !self.step(vault)? {}
+        let was = slot.as_ref().expect("the librarian's vault is in its slot").settled();
+        while !self.step(slot)? {}
         if !was {
             log::info!("kete: vault walk finished in {} ms, ahead of a write", t.elapsed().as_millis());
         }
@@ -233,18 +252,25 @@ impl Reopen {
 /// The thread exits when every sender drops (recv errs), dropping the engine; manifestus is crash-safe at any byte boundary, so no explicit flush handshake is needed.
 /// After a lazy open the walk that finds what is live runs here a step (a thousand index blocks) at a time whenever the mailbox is empty, so reads never wait for it; a write that arrives first finishes it.
 #[cfg(not(target_os = "ferros"))]
-fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<VaultOp>, reopen: Reopen) {
+fn librarian(vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<VaultOp>, reopen: Reopen) {
+    // The engine sits in a slot so the repair reopen (Reopen::step) can close it before opening the ring again; the macro reads it where the walk cannot have emptied it.
+    let mut slot: Option<Vault<FileDev, FileDev>> = Some(vault);
+    macro_rules! vault {
+        () => {
+            slot.as_mut().expect("the librarian's vault is in its slot")
+        };
+    }
     let mut pending: std::collections::VecDeque<VaultOp> = std::collections::VecDeque::new();
     let walk_started = std::time::Instant::now();
     loop {
         // Idle: a step of the walk while it is unfinished, else block for one op. Busy: drain whatever queued while the last op ran.
         if pending.is_empty() {
-            if !vault.settled() {
+            if !vault!().settled() {
                 match rx.try_recv() {
                     Ok(op) => pending.push_back(op),
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        match reopen.step(&mut vault) {
+                        match reopen.step(&mut slot) {
                             Ok(true) => log::info!("kete: vault walk finished {} ms after the open", walk_started.elapsed().as_millis()),
                             Ok(false) => {}
                             // Left unsettled: the next write tries again and carries the error to its caller.
@@ -278,20 +304,20 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                     // A read queued behind a mutation to the same address answers with that mutation's value (the newest gathered so far), so it is as fresh as every write posted before it without waiting for the commit; the read cache's fill rule relies on this (LIB-16, 2026-11-03).
                     let answer = match batch.iter().rev().find(|(a, _)| *a == addr) {
                         Some((_, pending)) => Ok(pending.clone()),
-                        None => vault.get(&addr).map_err(|e| e.to_string()),
+                        None => vault!().get(&addr).map_err(|e| e.to_string()),
                     };
                     let _ = reply.send(answer);
                 }
                 VaultOp::Degraded { reply } => {
-                    let _ = reply.send(vault.degraded());
+                    let _ = reply.send(vault!().degraded());
                 }
                 VaultOp::Keys { reply } => {
-                    let _ = reply.send(vault.live_keys().map_err(|e| e.to_string()));
+                    let _ = reply.send(vault!().live_keys().map_err(|e| e.to_string()));
                 }
                 VaultOp::Stats { reply } => {
                     // The live set's numbers are the walk's: finish it (best-effort; an unsettled vault reports what it knows).
-                    let _ = reopen.settle(&mut vault);
-                    let _ = reply.send(vault.engine_stats());
+                    let _ = reopen.settle(&mut slot);
+                    let _ = reply.send(vault!().engine_stats());
                 }
                 VaultOp::Put { addr, stored, reply } => {
                     batch.push((addr, Some(stored)));
@@ -311,7 +337,7 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
             let t = std::time::Instant::now();
             let ops = batch.len();
             let bytes: usize = batch.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len())).sum();
-            let r = reopen.settle(&mut vault).and_then(|()| apply_growing(&mut vault, &batch));
+            let r = reopen.settle(&mut slot).and_then(|()| apply_growing(vault!(), &batch));
             let ms = t.elapsed().as_millis();
             if ms > 200 {
                 log::warn!(
@@ -326,7 +352,7 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
                 let _ = reply.send(r.clone());
             }
             // The batch's callers are answered; reclaim belongs here, between batches, not inside the next caller's commit.
-            reclaim_while_idle(&mut vault, &rx, &mut pending);
+            reclaim_while_idle(vault!(), &rx, &mut pending);
         }
     }
 }
@@ -441,6 +467,8 @@ pub struct FlatStorage {
     secret: [u8; 32],
     /// The librarian's mailbox.
     ops: Mutex<std::sync::mpsc::Sender<VaultOp>>,
+    /// The librarian thread itself, joined on drop so the ring is closed, and its cross-process lock released, before the handle is gone (manifestus LIB-07): a drop that returned while the thread was still closing let an immediate reopen of the same ring race the lock and read Busy.
+    librarian: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// STORED-bytes read cache, sorted by address for binary search (ciphertext for encrypted vaults — RAM stays as sealed as disk): reads served from here NEVER touch the librarian, so no read ever waits behind a running commit. The 2026-08-21 field capture showed commits at 1-10s under disk load and every UI hitch was a read stuck behind one (render `pre 3772ms`, conversation-open stalls). A write posts its op and then caches the value (read-your-own-writes — a racing reader sees the value that is about to be durable, and a miss queued behind the op is answered from the librarian's gathered batch); a delete caches known-absence, so repeated misses skip the round-trip too; a failed commit drops what it cached. Bounded by [`ReadCache::CAP_BYTES`]: past it the whole cache clears (readers fall thru to the librarian — pure correctness, cold speed).
     read_cache: Mutex<ReadCache>,
     /// Mirrors diverged at open and were replicated back into agreement.
@@ -449,6 +477,20 @@ pub struct FlatStorage {
     repaired_lost_values: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Whether values are encrypted (per-key ChaCha20-Poly1305) before storage. False = plaintext: the vault still gives integrity + durability (manifestus BLAKE3-seals every block), values are just stored as-is and stay inspectable on disk (e.g. `vsfinfo` on a VSF value). The caller's choice — a plaintext vault is not leaked-file-safe.
     encrypt: bool,
+}
+
+impl Drop for FlatStorage {
+    /// Close synchronously: hand the librarian a dead mailbox so it leaves its loop, then wait for it, so the ring files are closed and their lock is free the moment this handle is gone.
+    fn drop(&mut self) {
+        let (dead, _) = std::sync::mpsc::channel();
+        if let Ok(mut ops) = self.ops.lock() {
+            drop(std::mem::replace(&mut *ops, dead));
+        }
+        if let Some(h) = self.librarian.lock().ok().and_then(|mut g| g.take()) {
+            // A librarian that panicked has already dropped its vault; there is nothing left to wait for.
+            let _ = h.join();
+        }
+    }
 }
 
 impl FlatStorage {
@@ -548,7 +590,7 @@ impl FlatStorage {
     fn open(app: App, _filename: String, identity: Option<[u8; 32]>, secret: [u8; 32], encrypt: bool) -> Result<Self, StorageError> {
         let store = ferros::KernelStore::open().ok_or_else(|| StorageError::Vault("ferros: this process holds no vault scope (spawn it with --store)".to_string()))?;
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        let librarian = std::thread::Builder::new()
             .name("kete-librarian".to_string())
             .spawn(move || ferros::librarian(store, rx))
             .map_err(StorageError::Io)?;
@@ -557,6 +599,7 @@ impl FlatStorage {
             identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
+            librarian: Mutex::new(Some(librarian)),
             read_cache: Mutex::new(ReadCache::new()),
             healed_at_open: false,
             repaired_lost_values: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -610,7 +653,7 @@ impl FlatStorage {
         log::info!("kete: vault open in {} ms ({} ms resyncing the mirrors{}), its walk to follow between requests", opened.elapsed().as_millis(), replicated_ms, if healed_at_open { ", which had diverged" } else { "" });
         // Hand the engine to its librarian — from here on, only that thread touches manifestus.
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        let librarian = std::thread::Builder::new()
             .name("kete-librarian".to_string())
             .spawn(move || librarian(vault, rx, reopen))
             .map_err(|e| StorageError::Io(e))?;
@@ -619,6 +662,7 @@ impl FlatStorage {
             identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
+            librarian: Mutex::new(Some(librarian)),
             read_cache: Mutex::new(ReadCache::new()),
             healed_at_open,
             repaired_lost_values: lost,
