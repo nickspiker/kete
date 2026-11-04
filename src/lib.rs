@@ -275,7 +275,12 @@ fn librarian(mut vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<V
         while let Some(op) = pending.pop_front() {
             match op {
                 VaultOp::Get { addr, reply } => {
-                    let _ = reply.send(vault.get(&addr).map_err(|e| e.to_string()));
+                    // A read queued behind a mutation to the same address answers with that mutation's value (the newest gathered so far), so it is as fresh as every write posted before it without waiting for the commit; the read cache's fill rule relies on this (LIB-16, 2026-11-03).
+                    let answer = match batch.iter().rev().find(|(a, _)| *a == addr) {
+                        Some((_, pending)) => Ok(pending.clone()),
+                        None => vault.get(&addr).map_err(|e| e.to_string()),
+                    };
+                    let _ = reply.send(answer);
                 }
                 VaultOp::Degraded { reply } => {
                     let _ = reply.send(vault.degraded());
@@ -436,8 +441,8 @@ pub struct FlatStorage {
     secret: [u8; 32],
     /// The librarian's mailbox.
     ops: Mutex<std::sync::mpsc::Sender<VaultOp>>,
-    /// STORED-bytes read cache, sorted by address for binary search (ciphertext for encrypted vaults — RAM stays as sealed as disk): reads served from here NEVER touch the librarian, so no read ever waits behind a running commit. The 2026-08-21 field capture showed commits at 1-10s under disk load and every UI hitch was a read stuck behind one (render `pre 3772ms`, conversation-open stalls). Write path inserts BEFORE posting (read-your-own-writes — a racing reader sees the value that is about to be durable); delete removes; `None` caches known-absence so repeated misses skip the round-trip too. Bounded: past CACHE_CAP_BYTES the whole cache clears (readers fall thru to the librarian — pure correctness, cold speed).
-    read_cache: Mutex<Vec<([u8; 32], Option<Vec<u8>>)>>,
+    /// STORED-bytes read cache, sorted by address for binary search (ciphertext for encrypted vaults — RAM stays as sealed as disk): reads served from here NEVER touch the librarian, so no read ever waits behind a running commit. The 2026-08-21 field capture showed commits at 1-10s under disk load and every UI hitch was a read stuck behind one (render `pre 3772ms`, conversation-open stalls). A write posts its op and then caches the value (read-your-own-writes — a racing reader sees the value that is about to be durable, and a miss queued behind the op is answered from the librarian's gathered batch); a delete caches known-absence, so repeated misses skip the round-trip too; a failed commit drops what it cached. Bounded by [`ReadCache::CAP_BYTES`]: past it the whole cache clears (readers fall thru to the librarian — pure correctness, cold speed).
+    read_cache: Mutex<ReadCache>,
     /// Mirrors diverged at open and were replicated back into agreement.
     healed_at_open: bool,
     /// Values LOST by the repair fallback: the strict open (or its walk, stepped by the librarian after a lazy open) refused (torn/reused block behind a committed pointer) and `open_repairing` pruned that many dangling pointers to boot at all; counted when the walk meets it, which may be after the open returned. 0 = nothing lost (clean open, or repair found only stale no-data pointers). Callers surface this to the user — a silent prune is how "storage degraded" turns into a mystery.
@@ -552,7 +557,7 @@ impl FlatStorage {
             identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
-            read_cache: Mutex::new(Vec::new()),
+            read_cache: Mutex::new(ReadCache::new()),
             healed_at_open: false,
             repaired_lost_values: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             encrypt,
@@ -614,35 +619,201 @@ impl FlatStorage {
             identity: Mutex::new(identity),
             secret,
             ops: Mutex::new(tx),
-            read_cache: Mutex::new(Vec::new()),
+            read_cache: Mutex::new(ReadCache::new()),
             healed_at_open,
             repaired_lost_values: lost,
             encrypt,
         })
     }
 
-    /// Read-cache size ceiling (sum of cached value bytes). The whole vault is tens of MB in practice, so a warm session fits; a bulk-content future (avatars, attachments) hits the cap and clears — correctness never depends on residency.
-    const CACHE_CAP_BYTES: usize = 64 * 1024 * 1024;
-
-    /// Insert/replace a cache entry, clearing the whole cache first if it would exceed the cap.
-    fn cache_put(&self, addr: [u8; 32], stored: Option<Vec<u8>>) {
+    /// Post one WRITE-side op: send it, then apply `cache` under the cache lock, then wait for the librarian's verdict; on a failed commit (or a dead librarian) every address in `addrs` is dropped from the cache, so a value that never became durable is never served from RAM (LIB-16, 2026-11-03).
+    /// Send BEFORE caching: a reader that misses after the cache change then has its Get queued behind this op, and the librarian answers it from the gathered batch, so no fill can land an older value over the one cached here.
+    fn post_write(
+        &self,
+        op: VaultOp,
+        reply_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+        addrs: &[[u8; 32]],
+        cache: impl FnOnce(&mut ReadCache),
+    ) -> Result<(), StorageError> {
+        let sent = self
+            .ops
+            .lock()
+            .map_err(|_| StorageError::Vault("vault mailbox lock poisoned".to_string()))
+            .and_then(|tx| tx.send(op).map_err(|_| StorageError::Vault("vault thread gone".to_string())));
+        if let Err(e) = sent {
+            return Err(e);
+        }
         if let Ok(mut c) = self.read_cache.lock() {
-            let incoming = stored.as_ref().map_or(0, |v| v.len());
-            let held: usize = c.iter().map(|(_, v)| v.as_ref().map_or(0, |b| b.len())).sum();
-            if held + incoming > Self::CACHE_CAP_BYTES {
-                c.clear();
+            cache(&mut c);
+        }
+        let verdict = reply_rx
+            .recv()
+            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))
+            .and_then(|r| r.map_err(StorageError::Vault));
+        if verdict.is_err() {
+            if let Ok(mut c) = self.read_cache.lock() {
+                for addr in addrs {
+                    c.remove(addr);
+                }
             }
-            match c.binary_search_by(|(a, _)| a.cmp(&addr)) {
-                Ok(i) => c[i].1 = stored,
-                Err(i) => c.insert(i, (addr, stored)),
+        }
+        verdict
+    }
+
+    /// [`post_write`](Self::post_write) for a Batch: every item is cached (a put's value, a delete's absence) once the batch is posted, and dropped again if the commit fails.
+    fn post_write_batch(&self, items: Vec<([u8; 32], Option<Vec<u8>>)>) -> Result<(), StorageError> {
+        let cached: Vec<([u8; 32], Option<Vec<u8>>)> = items.clone();
+        let addrs: Vec<[u8; 32]> = items.iter().map(|(a, _)| *a).collect();
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.post_write(VaultOp::Batch { items, reply }, reply_rx, &addrs, |c| {
+            for (addr, stored) in cached {
+                c.put(addr, stored);
             }
+        })
+    }
+
+    /// The cached stored bytes at `addr` (`Some(None)` = known absent) and the cache generation the lookup was made at, which a miss hands back to [`cache_fill`](Self::cache_fill).
+    fn cache_lookup(&self, addr: &[u8; 32]) -> (Option<Option<Vec<u8>>>, u64) {
+        match self.read_cache.lock() {
+            Ok(c) => (c.lookup(addr), c.generation()),
+            Err(_) => (None, 0),
         }
     }
 
-    /// The cached stored bytes at `addr` (`Some(None)` = known absent), by binary search over the address-sorted cache.
-    fn cache_get(c: &[([u8; 32], Option<Vec<u8>>)], addr: &[u8; 32]) -> Option<Option<Vec<u8>>> {
-        c.binary_search_by(|(a, _)| a.cmp(addr)).ok().map(|i| c[i].1.clone())
+    /// Install what the librarian answered for a miss looked up at generation `posted`, unless a write since could make it stale (see [`ReadCache::fill`]).
+    fn cache_fill(&self, addr: [u8; 32], stored: Option<Vec<u8>>, posted: u64) {
+        if let Ok(mut c) = self.read_cache.lock() {
+            c.fill(addr, stored, posted);
+        }
     }
+}
+
+/// One cached address: its STORED bytes (`None` = known absent) and the cache generation it was installed at.
+struct CacheEntry {
+    addr: [u8; 32],
+    stored: Option<Vec<u8>>,
+    generation: u64,
+}
+
+/// The read cache's body: STORED bytes by address, sorted for binary search, plus the bookkeeping that keeps a librarian round trip from overwriting a newer write and keeps the byte cap honest (LIB-16, 2026-11-03).
+///
+/// Every write-side change (a put, an absence marker, a drop, a clear) bumps `generation` and stamps what it installs. A read that misses records the generation it looked up at, posts its Get, and offers the answer to [`fill`](Self::fill), which refuses it when the slot was stamped by a later write or when any entry was removed since (a removed entry leaves no stamp to compare against, so `purged` stands in for every address).
+pub(crate) struct ReadCache {
+    entries: Vec<CacheEntry>,
+    /// Sum of the cached value bytes, kept as a running total: a put costs its binary search, never a scan of every entry.
+    held: usize,
+    /// Bumped by every write-side change; what a fill compares its lookup generation against.
+    generation: u64,
+    /// The generation of the latest drop or clear.
+    purged: u64,
+}
+
+impl ReadCache {
+    /// Read-cache size ceiling (sum of cached value bytes). The whole vault is tens of MB in practice, so a warm session fits; a bulk-content future (avatars, attachments) hits the cap and clears — correctness never depends on residency.
+    const CAP_BYTES: usize = 1 << 26;
+
+    fn new() -> Self {
+        Self { entries: Vec::new(), held: 0, generation: 0, purged: 0 }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Cached value bytes held right now.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.held
+    }
+
+    fn find(&self, addr: &[u8; 32]) -> Result<usize, usize> {
+        self.entries.binary_search_by(|e| e.addr.cmp(addr))
+    }
+
+    /// The cached stored bytes at `addr` (`Some(None)` = known absent).
+    fn lookup(&self, addr: &[u8; 32]) -> Option<Option<Vec<u8>>> {
+        self.find(addr).ok().map(|i| self.entries[i].stored.clone())
+    }
+
+    /// A write's value (or absence marker) for `addr`: stamped with a fresh generation, so every fill looked up before it is refused.
+    fn put(&mut self, addr: [u8; 32], stored: Option<Vec<u8>>) {
+        self.generation += 1;
+        let incoming = stored.as_ref().map_or(0, |v| v.len());
+        // WHY: a single value past the cap is not cached, else the cap would hold for every value but this one.
+        // PROOF: `install` clears the cache only when the OTHER entries plus this one exceed the cap, so an entry larger than the cap on its own would be installed into an empty cache and sit there, over the cap, until the next put.
+        if incoming > Self::CAP_BYTES {
+            self.remove(&addr);
+            return;
+        }
+        let generation = self.generation;
+        self.install(addr, stored, incoming, generation);
+    }
+
+    /// The librarian's answer for a miss looked up at generation `posted`: installed only if no write could have outrun it, i.e. the slot carries no later stamp and nothing was removed since the lookup.
+    fn fill(&mut self, addr: [u8; 32], stored: Option<Vec<u8>>, posted: u64) {
+        if self.purged > posted {
+            return;
+        }
+        if let Ok(i) = self.find(&addr) {
+            if self.entries[i].generation > posted {
+                return;
+            }
+        }
+        let incoming = stored.as_ref().map_or(0, |v| v.len());
+        // WHY: same cap rule as `put`; a fill of an oversized value is simply not cached (there is nothing newer to drop, since any later write would have refused this fill above).
+        if incoming > Self::CAP_BYTES {
+            return;
+        }
+        self.install(addr, stored, incoming, posted);
+    }
+
+    /// Replace or insert the entry, keeping `held` exact; when the entries present plus this one would pass the cap, the cache clears first (readers fall thru to the librarian — pure correctness, cold speed).
+    fn install(&mut self, addr: [u8; 32], stored: Option<Vec<u8>>, incoming: usize, generation: u64) {
+        match self.find(&addr) {
+            Ok(i) => {
+                let outgoing = self.entries[i].stored.as_ref().map_or(0, |v| v.len());
+                if self.held - outgoing + incoming > Self::CAP_BYTES {
+                    self.clear();
+                    self.entries.push(CacheEntry { addr, stored, generation });
+                } else {
+                    self.held -= outgoing;
+                    self.entries[i].stored = stored;
+                    self.entries[i].generation = generation;
+                }
+            }
+            Err(i) => {
+                if self.held + incoming > Self::CAP_BYTES {
+                    self.clear();
+                    self.entries.push(CacheEntry { addr, stored, generation });
+                } else {
+                    self.entries.insert(i, CacheEntry { addr, stored, generation });
+                }
+            }
+        }
+        self.held += incoming;
+    }
+
+    /// Remove the entry at `addr` and refuse every fill looked up before now: the slot keeps no stamp once it is empty.
+    fn remove(&mut self, addr: &[u8; 32]) {
+        self.generation += 1;
+        self.purged = self.generation;
+        if let Ok(i) = self.find(addr) {
+            let outgoing = self.entries[i].stored.as_ref().map_or(0, |v| v.len());
+            self.held -= outgoing;
+            self.entries.remove(i);
+        }
+    }
+
+    /// Remove every entry and refuse every fill looked up before now.
+    fn clear(&mut self) {
+        self.generation += 1;
+        self.purged = self.generation;
+        self.entries.clear();
+        self.held = 0;
+    }
+}
+
+impl FlatStorage {
 
     /// Write data under a logical **string** key. Hashes the key to a 32-byte vault address (so the string never reaches disk), then delegates to [`write_addr`](Self::write_addr). For callers whose key is genuinely a string (table/pk/seq, e.g. rārangi). Callers that already hold a 32-byte address (a seed, a conversation id) should use [`write_addr`](Self::write_addr) directly rather than text-encoding it first.
     pub fn write(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
@@ -667,18 +838,18 @@ impl FlatStorage {
         } else {
             data.to_vec()
         };
-        // Cache BEFORE posting: read-your-own-writes — a reader racing this write sees the value about to become durable instead of stalling behind the commit.
-        self.cache_put(*addr, Some(stored.clone()));
+        // Post, then cache: read-your-own-writes — a reader racing this write sees the value about to become durable instead of stalling behind the commit (post_write says why this order).
+        let cached = stored.clone();
+        let addr = *addr;
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Put { addr: *addr, stored, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write(VaultOp::Put { addr, stored, reply }, reply_rx, &[addr], |c| c.put(addr, Some(cached)))
     }
 
     /// Read the value at a 32-byte vault **address**. Returns `None` if absent. Every block on the path is hash-verified by manifestus.
     /// Reads jump the librarian's queued writes (see [`librarian`]), so this waits for at most one in-flight write — never a persist burst. Decrypt runs on the caller's thread.
     pub fn read_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         // Cache first — a hit never touches the librarian, so no read waits behind a running commit (the 2026-08-21 hitches). Decrypt still runs per read; RAM holds only stored bytes.
-        let cached = self.read_cache.lock().ok().and_then(|c| Self::cache_get(&c, addr));
+        let (cached, posted) = self.cache_lookup(addr);
         let stored = match cached {
             Some(hit) => hit,
             None => {
@@ -686,7 +857,7 @@ impl FlatStorage {
                 let fetched = self
                     .post(VaultOp::Get { addr: *addr, reply }, reply_rx)?
                     .map_err(StorageError::Vault)?;
-                self.cache_put(*addr, fetched.clone());
+                self.cache_fill(*addr, fetched.clone(), posted);
                 fetched
             }
         };
@@ -703,14 +874,13 @@ impl FlatStorage {
 
     /// Remove the value at a 32-byte vault **address**. Blocks zeroed on both mirrors immediately; the plow reaps the slots.
     pub fn delete_addr(&self, addr: &[u8; 32]) -> Result<(), StorageError> {
-        // Known-absent in the cache immediately (same read-your-own-writes rule as write_addr).
-        self.cache_put(*addr, None);
+        // Known-absent in the cache as soon as the op is posted (same read-your-own-writes rule as write_addr).
+        let addr = *addr;
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Delete { addr: *addr, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write(VaultOp::Delete { addr, reply }, reply_rx, &[addr], |c| c.put(addr, None))
     }
 
-    /// Apply MANY put-or-delete addr ops IN ORDER as one librarian batch — (usually) ONE manifestus commit for the lot, instead of one durable round-trip per op. `Some(data)` = put, `None` = delete. This is the transaction shape for rārangi's transact: its apply phase [row puts + catalog + superroot + WAL retire] rode 4-5 serial commits per row before this (the 2026-09-02 field day's 40s message sends); posted as one Batch it is one flush. Encrypt runs on the caller's thread per the write_addr law; every entry hits the read cache before posting (read-your-own-writes). Durable on return. NOT all-or-nothing under fence pressure (a heartbeat commit can land a prefix early — never out of order); callers needing atomicity anchor on their own journal, exactly as rārangi's WAL does.
+    /// Apply MANY put-or-delete addr ops IN ORDER as one librarian batch — (usually) ONE manifestus commit for the lot, instead of one durable round-trip per op. `Some(data)` = put, `None` = delete. This is the transaction shape for rārangi's transact: its apply phase [row puts + catalog + superroot + WAL retire] rode 4-5 serial commits per row before this (the 2026-09-02 field day's 40s message sends); posted as one Batch it is one flush. Encrypt runs on the caller's thread per the write_addr law; every entry hits the read cache once the batch is posted (read-your-own-writes). Durable on return. NOT all-or-nothing under fence pressure (a heartbeat commit can land a prefix early — never out of order); callers needing atomicity anchor on their own journal, exactly as rārangi's WAL does.
     pub fn apply_addr_batch(
         &self,
         items: Vec<([u8; 32], Option<Vec<u8>>)>,
@@ -728,18 +898,14 @@ impl FlatStorage {
                     } else {
                         data
                     };
-                    self.cache_put(addr, Some(stored.clone()));
                     stored_items.push((addr, Some(stored)));
                 }
                 None => {
-                    self.cache_put(addr, None);
                     stored_items.push((addr, None));
                 }
             }
         }
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Batch { items: stored_items, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write_batch(stored_items)
     }
 
     /// The 32-byte vault address a logical **string** key maps to — for callers (rārangi) that batch string-keyed and addr-keyed ops thru [`apply_addr_batch`](Self::apply_addr_batch) and need the derivation without a write.
@@ -760,16 +926,15 @@ impl FlatStorage {
         } else {
             data.to_vec()
         };
-        self.cache_put(addr, Some(stored.clone()));
+        let cached = stored.clone();
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Put { addr, stored, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write(VaultOp::Put { addr, stored, reply }, reply_rx, &[addr], |c| c.put(addr, Some(cached)))
     }
 
     /// DEVICE-scope read — see [`write_device`](Self::write_device).
     pub fn read_device(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let addr = self.derive_device_entry_key(key);
-        let cached = self.read_cache.lock().ok().and_then(|c| Self::cache_get(&c, &addr));
+        let (cached, posted) = self.cache_lookup(&addr);
         let stored = match cached {
             Some(hit) => hit,
             None => {
@@ -777,7 +942,7 @@ impl FlatStorage {
                 let fetched = self
                     .post(VaultOp::Get { addr, reply }, reply_rx)?
                     .map_err(StorageError::Vault)?;
-                self.cache_put(addr, fetched.clone());
+                self.cache_fill(addr, fetched.clone(), posted);
                 fetched
             }
         };
@@ -795,7 +960,7 @@ impl FlatStorage {
     /// DEVICE-scope read of a BULK value ([`write_device_bulk`](Self::write_device_bulk)): straight from the librarian, never the read cache, and nothing added to it. A value written through the cache still reads as cached.
     pub fn read_device_bulk(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let addr = self.derive_device_entry_key(key);
-        let cached = self.read_cache.lock().ok().and_then(|c| Self::cache_get(&c, &addr));
+        let (cached, _) = self.cache_lookup(&addr);
         let stored = match cached {
             Some(hit) => hit,
             None => {
@@ -813,7 +978,7 @@ impl FlatStorage {
         Ok(Some(plaintext))
     }
 
-    /// DEVICE-scope write of many BULK values as one librarian batch, kept OUT of the read cache: values the caller holds itself and reads back rarely (Mahere's downloaded map cells, Nick 2026-10-25), which through the cache would fill it past its cap and clear everyone's entries with it. A cached entry at one of the keys is dropped, never left stale. Durable on return; until then a read may answer from before the write (the librarian answers queued reads first), so a caller that must read its own writes holds them until this returns.
+    /// DEVICE-scope write of many BULK values as one librarian batch, kept OUT of the read cache: values the caller holds itself and reads back rarely (Mahere's downloaded map cells, Nick 2026-10-25), which through the cache would fill it past its cap and clear everyone's entries with it. A cached entry at one of the keys is dropped once the batch is posted, never left stale, and a fill from a read that looked up before the drop is refused. Durable on return; a read posted before this one may still answer from before the write, so a caller that must read its own writes holds them until this returns.
     pub fn write_device_bulk(&self, entries: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
         if entries.is_empty() {
             return Ok(());
@@ -828,16 +993,14 @@ impl FlatStorage {
             };
             items.push((addr, Some(stored)));
         }
-        if let Ok(mut c) = self.read_cache.lock() {
-            for (addr, _) in &items {
-                if let Ok(i) = c.binary_search_by(|(a, _)| a.cmp(addr)) {
-                    c.remove(i);
-                }
-            }
-        }
+        let addrs: Vec<[u8; 32]> = items.iter().map(|(a, _)| *a).collect();
+        let dropped = addrs.clone();
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Batch { items, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write(VaultOp::Batch { items, reply }, reply_rx, &addrs, |c| {
+            for addr in &dropped {
+                c.remove(addr);
+            }
+        })
     }
 
     /// DEVICE-scope read by ADDRESS (from [`live_addrs`](Self::live_addrs)): the value decrypted as a device-scope entry, for an app taking stock of what its vault holds when it no longer knows every key (Mahere 2026-10-19). An identity-scope value at that address does not decrypt and reads as an error.
@@ -858,21 +1021,14 @@ impl FlatStorage {
         if addrs.is_empty() {
             return Ok(());
         }
-        for a in addrs {
-            self.cache_put(*a, None);
-        }
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Batch { items: addrs.iter().map(|a| (*a, None)).collect(), reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write_batch(addrs.iter().map(|a| (*a, None)).collect())
     }
 
     /// DEVICE-scope delete — see [`write_device`](Self::write_device).
     pub fn delete_device(&self, key: &str) -> Result<(), StorageError> {
         let addr = self.derive_device_entry_key(key);
-        self.cache_put(addr, None);
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Delete { addr, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write(VaultOp::Delete { addr, reply }, reply_rx, &[addr], |c| c.put(addr, None))
     }
 
     /// DEVICE-scope delete of MANY keys as one librarian batch — (usually) one manifestus commit for the lot instead of one durable round trip per key (Mahere 2026-10-18: moving its cell cache, hundreds of thousands of entries, out of the vault). An absent key is a no-op, as for [`delete_device`](Self::delete_device). Durable on return.
@@ -883,12 +1039,9 @@ impl FlatStorage {
         let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::with_capacity(keys.len());
         for key in keys {
             let addr = self.derive_device_entry_key(key);
-            self.cache_put(addr, None);
             items.push((addr, None));
         }
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Batch { items, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write_batch(items)
     }
 
     /// DEVICE-scope write of MANY keys as one librarian batch — (usually) one manifestus commit for the lot instead of one durable round trip per key (Mahere 2026-10-25: a view's cells arrive by the hundred). Encrypted on the caller's thread and visible to reads at once, as for [`write_device`](Self::write_device). Durable on return.
@@ -904,12 +1057,9 @@ impl FlatStorage {
             } else {
                 data.clone()
             };
-            self.cache_put(addr, Some(stored.clone()));
             items.push((addr, Some(stored)));
         }
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Batch { items, reply }, reply_rx)?
-            .map_err(StorageError::Vault)
+        self.post_write_batch(items)
     }
 
     /// Device-scope entry ADDRESS — a distinct context from the identity-scope entry address, so the two scopes can never collide on a storage slot even for an identical logical key.
@@ -995,11 +1145,9 @@ impl FlatStorage {
 
     /// One librarian batch of already-sealed values, as [`rehome_into`](Self::rehome_into) hands them over.
     fn post_batch(&self, items: Vec<([u8; 32], Option<Vec<u8>>)>) -> Result<(), StorageError> {
-        if let Ok(mut c) = self.read_cache.lock() {
-            c.clear();
-        }
+        let addrs: Vec<[u8; 32]> = items.iter().map(|(a, _)| *a).collect();
         let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.post(VaultOp::Batch { items, reply }, reply_rx)?.map_err(StorageError::Vault)
+        self.post_write(VaultOp::Batch { items, reply }, reply_rx, &addrs, |c| c.clear())
     }
 
     /// How many values the repair-open fallback pruned to boot this vault (0 = clean open or no data lost). Callers surface a nonzero count — the loss already happened; hiding it is the only way to make it worse.
@@ -1457,7 +1605,7 @@ mod tests {
             assert_eq!(v.read_device("setting").unwrap().as_deref(), Some(&b"new"[..]), "a bulk write leaves no stale cached value");
             assert_eq!(v.read_device_bulk("cell 7").unwrap().as_deref(), Some(&[7u8; 9000][..]));
             assert_eq!(v.read_device("b").unwrap().as_deref(), Some(&[2u8; 50][..]));
-            let cached: usize = v.read_cache.lock().unwrap().iter().map(|(_, x)| x.as_ref().map_or(0, |b| b.len())).sum();
+            let cached: usize = v.read_cache.lock().unwrap().held();
             assert!(cached < 9000, "bulk values are not cached ({cached} bytes held)");
         }
         let v = FlatStorage::open_device_shared(APP, dev).unwrap();
@@ -1493,5 +1641,81 @@ mod tests {
         assert_eq!(store.read("k").unwrap().as_deref(), Some(&b"in the clear"[..]));
         store.delete("k").unwrap();
         assert!(store.read("k").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::ReadCache;
+
+    const X: [u8; 32] = [0x11; 32];
+    const Y: [u8; 32] = [0x22; 32];
+    const Z: [u8; 32] = [0x33; 32];
+
+    /// LIB-16 (1), the auditor's interleaving: a reader misses, a writer caches a newer value and posts its Put, the librarian answers the reader's older Get first, and the reader's fill must not overwrite the newer value.
+    #[test]
+    fn a_fill_never_overwrites_a_later_put() {
+        let mut c = ReadCache::new();
+        let (miss, posted) = (c.lookup(&X), c.generation());
+        assert!(miss.is_none());
+        c.put(X, Some(b"new".to_vec()));
+        c.fill(X, Some(b"old".to_vec()), posted);
+        assert_eq!(c.lookup(&X), Some(Some(b"new".to_vec())));
+        // The same race against an absence marker (a delete).
+        let posted = c.generation();
+        c.put(X, None);
+        c.fill(X, Some(b"old".to_vec()), posted);
+        assert_eq!(c.lookup(&X), Some(None));
+        // A fill with nothing newer lands, and a put after it wins.
+        let posted = c.generation();
+        c.fill(Y, Some(b"fetched".to_vec()), posted);
+        assert_eq!(c.lookup(&Y), Some(Some(b"fetched".to_vec())));
+        c.put(Y, Some(b"written".to_vec()));
+        assert_eq!(c.lookup(&Y), Some(Some(b"written".to_vec())));
+    }
+
+    /// LIB-16 (2): a removed entry leaves no stamp, so every fill looked up before the removal is refused — a failed commit's rollback, a bulk write's drop, a cap clear.
+    #[test]
+    fn a_drop_or_clear_refuses_older_fills() {
+        let mut c = ReadCache::new();
+        c.put(X, Some(b"new".to_vec()));
+        let posted = c.generation();
+        c.remove(&X);
+        assert!(c.lookup(&X).is_none());
+        c.fill(X, Some(b"old".to_vec()), posted);
+        assert!(c.lookup(&X).is_none(), "a fill looked up before the drop must not land");
+        let posted = c.generation();
+        c.fill(X, Some(b"fresh".to_vec()), posted);
+        assert_eq!(c.lookup(&X), Some(Some(b"fresh".to_vec())));
+        let posted = c.generation();
+        c.clear();
+        c.fill(Y, Some(b"old".to_vec()), posted);
+        assert!(c.lookup(&Y).is_none());
+    }
+
+    /// LIB-16 (3): the cap holds for the incoming entry too, and `held` tracks replace, drop and clear exactly without a rescan.
+    #[test]
+    fn the_cap_holds_and_held_stays_exact() {
+        let mut c = ReadCache::new();
+        c.put(X, Some(vec![0u8; 10]));
+        assert_eq!(c.held(), 10);
+        c.put(X, Some(vec![0u8; 4]));
+        assert_eq!(c.held(), 4);
+        c.put(Y, None);
+        assert_eq!(c.held(), 4);
+        c.put(Y, Some(vec![0u8; ReadCache::CAP_BYTES + 1]));
+        assert!(c.lookup(&Y).is_none(), "a value past the cap is not cached, and no older entry stays");
+        assert_eq!(c.held(), 4);
+        let posted = c.generation();
+        c.fill(Y, Some(vec![0u8; ReadCache::CAP_BYTES + 1]), posted);
+        assert!(c.lookup(&Y).is_none());
+        c.put(Y, Some(vec![0u8; ReadCache::CAP_BYTES - 4]));
+        assert_eq!(c.held(), ReadCache::CAP_BYTES);
+        c.put(Z, Some(vec![1u8]));
+        assert_eq!(c.held(), 1, "past the cap the cache clears and holds only the newcomer");
+        assert!(c.lookup(&X).is_none());
+        assert_eq!(c.lookup(&Z), Some(Some(vec![1u8])));
+        c.remove(&Z);
+        assert_eq!(c.held(), 0);
     }
 }
