@@ -40,13 +40,13 @@ fn off<T: ?Sized>(p: *const T) -> u64 {
     (p as *const u8 as u64).wrapping_sub(arc_base())
 }
 
-/// The grants page is arc offset 0: a u32 count, then 32-byte tokens; slot 0 is the console.
+/// The grants page is arc offset 0: the handle table in its first 512 bytes, then a u32 count at G#200 and the 32-byte tokens after it (ferros SANDBOX.md, "Handles", since 2026-11-03); slot 0 is the console.
 fn grant_count() -> u64 {
-    unsafe { (arc_base() as *const u32).read_volatile() as u64 }
+    unsafe { ((arc_base() + 0x200) as *const u32).read_volatile() as u64 }
 }
 
 fn cap(slot: u64) -> u64 {
-    4 + 32 * slot
+    0x204 + 32 * slot
 }
 
 /// The process's vault scope.
