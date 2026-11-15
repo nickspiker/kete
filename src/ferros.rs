@@ -1,4 +1,4 @@
-//! kete on ferros: the kernel's vault behind `FlatStorage`, no files anywhere. A process holds a Store capability for one scope of the device vault (the kernel hands it at spawn: `--store photon`), and this backend keeps every entry there by the 32-byte address kete already derives for it (the address goes to the kernel as those bytes, SYS_STORE bit 5, nothing encoded, nothing named); the kernel scopes it and keeps the scope's address list for `live_keys`. Reads come in transfers as large as the kernel and the vault take (1 MiB, `SIZES`), writes in 4 KiB pieces (KERNEL.md, syscall 13). The librarian thread serves `VaultOp`s one by one, a batch in order (the kernel commits each put, so a batch is not atomic here).
+//! kete on ferros: the kernel's vault behind `FlatStorage`, no files anywhere. A process holds a Store capability for one scope of the device vault (the kernel hands it at spawn: `--store photon`), and this backend keeps every entry there by the 32-byte address kete already derives for it (the address goes to the kernel as those bytes, SYS_STORE bit 5, nothing encoded, nothing named); the kernel scopes it and keeps the scope's address list for `live_keys`. Reads come in transfers as large as the kernel and the vault take (1 MiB, `SIZES`), writes in pieces as large as a set takes (256 KiB, `put`; KERNEL.md, syscall 13). The librarian thread serves `VaultOp`s one by one, a batch in order (the kernel commits each put, so a batch is not atomic here).
 //!
 //! The identity vault's and the device vault's addresses never meet: kete derives them under different keys (`derive_entry_key`, `derive_device_entry_key`), so one scope holds both.
 //!
@@ -59,6 +59,8 @@ pub(crate) struct KernelStore {
     /// The largest transfer a get and a listing last got (`read_all`).
     get_most: Cell<usize>,
     list_most: Cell<usize>,
+    /// The largest piece a set last got through (`put`).
+    set_most: Cell<usize>,
 }
 
 impl KernelStore {
@@ -66,7 +68,7 @@ impl KernelStore {
     pub(crate) fn open() -> Option<Self> {
         let mut probe = [0u8; 8];
         let cap = (1..grant_count().min(64)).map(cap).find(|&c| svc(STORE, c, ADDR | LIST | AT | 8 << 8, off(b"".as_ptr()), 0, off(probe.as_mut_ptr())) != ERR)?;
-        Some(KernelStore { cap, get_most: Cell::new(SIZES[0]), list_most: Cell::new(SIZES[1]) })
+        Some(KernelStore { cap, get_most: Cell::new(SIZES[0]), list_most: Cell::new(SIZES[1]), set_most: Cell::new(SIZES[1]) })
     }
 
     /// One transfer of `buf.len()` bytes from `at`, straight into `buf`: the value's whole length (Some), None when there is no such value, Err when the kernel refused.
@@ -122,15 +124,29 @@ impl KernelStore {
         self.read_all(ADDR, addr, &self.get_most)
     }
 
+    /// A value in transfers as large as the kernel takes (a set's most is its STORE_MAX, 256 KiB since 2026-11-08; the vault process streams the pieces into one value whatever their size, checking each starts where the last ended), stepping down a size on a refusal and keeping the size that worked (`set_most`), as reads do.
+    /// Until 2026-11-15 every piece was 4 KiB: a 15.7 MB Lumis still was 3826 calls and took 2.6 s into the vault (the Pro, b882), about 0.7 ms a call, where the bytes' sealing and their blocks are a fraction of that.
     pub(crate) fn put(&self, addr: &[u8; 32], value: &[u8]) -> Result<(), String> {
         if value.len() <= PIECE {
             return (svc(STORE, self.cap, ADDR | SET | (value.len() as u64) << 8, off(addr.as_ptr()), 32, off(value.as_ptr())) == 0).then_some(()).ok_or_else(|| "ferros store: write refused".to_string());
         }
-        let pieces = value.len().div_ceil(PIECE);
-        for (i, piece) in value.chunks(PIECE).enumerate() {
-            let more = if i + 1 < pieces { MORE } else { 0 };
-            if svc(STORE, self.cap, ADDR | SET | AT | more | (piece.len() as u64) << 8 | ((i * PIECE) as u64) << 32, off(addr.as_ptr()), 32, off(piece.as_ptr())) != 0 {
-                return Err(format!("ferros store: write refused at piece {i}"));
+        let kept = self.set_most.get();
+        let mut at = 0;
+        while at < value.len() {
+            // WHY the min: the last piece is only what is left.
+            let n = (value.len() - at).min(self.set_most.get());
+            let more = if at + n < value.len() { MORE } else { 0 };
+            if svc(STORE, self.cap, ADDR | SET | AT | more | (n as u64) << 8 | (at as u64) << 32, off(addr.as_ptr()), 32, off(value[at..at + n].as_ptr())) == 0 {
+                at += n;
+                continue;
+            }
+            // Refused: a kernel that takes less (the same piece again a size down: the vault process's writer is untouched by a transfer the kernel refused), or the vault's own refusal, which a smaller piece meets again at the smallest size.
+            match SIZES[1..].iter().find(|&&s| s < n) {
+                Some(&s) => self.set_most.set(s),
+                None => {
+                    self.set_most.set(kept);
+                    return Err(format!("ferros store: write refused at byte {at}"));
+                }
             }
         }
         Ok(())
