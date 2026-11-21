@@ -173,6 +173,10 @@ pub(crate) fn librarian(store: KernelStore, rx: Receiver<VaultOp>) {
             VaultOp::Get { addr, reply } => {
                 let _ = reply.send(store.get(&addr));
             }
+            // One kernel call per address until the vault service has a batched get (docs/get-many.md, the proposed VOP_GET_MANY); the first refusal ends the batch, as a loop of gets would.
+            VaultOp::GetMany { addrs, reply } => {
+                let _ = reply.send(addrs.iter().map(|a| store.get(a)).collect());
+            }
             VaultOp::Put { addr, stored, reply } => {
                 let _ = reply.send(store.put(&addr, &stored));
             }

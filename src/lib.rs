@@ -137,6 +137,12 @@ enum VaultOp {
         addr: [u8; 32],
         reply: std::sync::mpsc::Sender<Result<Option<Vec<u8>>, String>>,
     },
+    /// Many reads in one message ([`FlatStorage::read_addr_batch`]): the stored bytes at each address, in the order asked, or the first error a Get of them would have given.
+    /// One trip through the mailbox instead of one per address, and on the host one pass over the index with nothing set up again between keys.
+    GetMany {
+        addrs: Vec<[u8; 32]>,
+        reply: std::sync::mpsc::Sender<Result<Vec<Option<Vec<u8>>>, String>>,
+    },
     Put {
         addr: [u8; 32],
         stored: Vec<u8>,
@@ -308,6 +314,9 @@ fn librarian(vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<Vault
                     };
                     let _ = reply.send(answer);
                 }
+                VaultOp::GetMany { addrs, reply } => {
+                    let _ = reply.send(get_many(vault!(), &batch, &addrs));
+                }
                 VaultOp::Degraded { reply } => {
                     let _ = reply.send(vault!().degraded());
                 }
@@ -355,6 +364,24 @@ fn librarian(vault: Vault<FileDev, FileDev>, rx: std::sync::mpsc::Receiver<Vault
             reclaim_while_idle(vault!(), &rx, &mut pending);
         }
     }
+}
+
+/// A GetMany on the host: each address answered exactly as a Get queued at this point would be (a mutation gathered ahead of it first, LIB-16), in the order asked, all in one turn of the librarian; the first error ends it, as it would end a loop of Gets.
+/// Asking the engine in address order instead (so neighbouring walks share index nodes in the mirror's block cache) measured no faster on pages of 128 rows (2026-11-20, two runs on a SATA SSD: 604 ms sorted, 565 ms as asked, for 2340 rows), so the order is the caller's.
+/// What the engine costs per key is its own: one index walk and the leaf, each block a device read under O_DIRECT once out of the mirror's cache (docs/get-many.md, "What a batch saves on the host").
+#[cfg(not(target_os = "ferros"))]
+fn get_many(
+    vault: &mut Vault<FileDev, FileDev>,
+    gathered: &[([u8; 32], Option<Vec<u8>>)],
+    addrs: &[[u8; 32]],
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    addrs
+        .iter()
+        .map(|addr| match gathered.iter().rev().find(|(a, _)| a == addr) {
+            Some((_, pending)) => Ok(pending.clone()),
+            None => vault.get(addr).map_err(|e| e.to_string()),
+        })
+        .collect()
 }
 
 /// RECLAIM AT THE IDLE EDGE: after a batch's replies are out, while the mailbox stays empty, step the vault's reap ahead one bounded window at a time.
@@ -914,6 +941,59 @@ impl FlatStorage {
         let plaintext =
             decrypt_bytes(&stored, &self.derive_enc_key_for_addr(addr)?).map_err(StorageError::Crypto)?;
         Ok(Some(plaintext))
+    }
+
+    /// Read MANY 32-byte vault **addresses** at once: one answer per address, in the order given, each exactly what [`read_addr`](Self::read_addr) returns for it (`None` when absent).
+    /// What a loop of `read_addr` costs once per address this costs once per call: the read cache looked up under one lock and filled under one more, every miss in ONE librarian message (on the host one turn of the engine over the index), and the identity read once for the decrypt pass on the caller's thread.
+    /// Err when any address would make `read_addr` fail; when several would fail differently, the vault's errors come before the decrypt ones.
+    /// Photon's row loader (a page of 128 rows): 2340 rows took ~470 ms as one `read_addr` each on a desktop, almost none of it the decrypt (2026-11-20).
+    pub fn read_addr_batch(&self, addrs: &[[u8; 32]]) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        let stored = self.fetch_stored_batch(addrs)?;
+        if !self.encrypt {
+            return Ok(stored);
+        }
+        // The identity once for the pass: a value present without one fails as read_addr's would, an absent one needs none.
+        let identity = self.identity();
+        let mut out = Vec::with_capacity(stored.len());
+        for (addr, stored) in addrs.iter().zip(stored) {
+            let Some(stored) = stored else {
+                out.push(None);
+                continue;
+            };
+            let identity = identity.ok_or_else(|| {
+                StorageError::Crypto("identity not set — pre-attest entries use the *_device methods".to_string())
+            })?;
+            let key = derive_addr_key(&self.app_id, addr, &identity, &self.secret);
+            out.push(Some(decrypt_bytes(&stored, &key).map_err(StorageError::Crypto)?));
+        }
+        Ok(out)
+    }
+
+    /// The STORED bytes at each address, in order, as `read_addr` finds them before its decrypt: the cache first (one lock), every miss in one GetMany, what came back offered to the cache (one more lock) under the same fill rule as a single read.
+    fn fetch_stored_batch(&self, addrs: &[[u8; 32]]) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (mut found, posted): (Vec<Option<Option<Vec<u8>>>>, u64) = match self.read_cache.lock() {
+            Ok(c) => (addrs.iter().map(|a| c.lookup(a)).collect(), c.generation()),
+            Err(_) => (vec![None; addrs.len()], 0),
+        };
+        let missed: Vec<usize> = (0..addrs.len()).filter(|&i| found[i].is_none()).collect();
+        if !missed.is_empty() {
+            let (reply, reply_rx) = std::sync::mpsc::channel();
+            let fetched = self
+                .post(VaultOp::GetMany { addrs: missed.iter().map(|&i| addrs[i]).collect(), reply }, reply_rx)?
+                .map_err(StorageError::Vault)?;
+            if let Ok(mut c) = self.read_cache.lock() {
+                for (&i, stored) in missed.iter().zip(&fetched) {
+                    c.fill(addrs[i], stored.clone(), posted);
+                }
+            }
+            for (i, stored) in missed.into_iter().zip(fetched) {
+                found[i] = Some(stored);
+            }
+        }
+        Ok(found.into_iter().map(|f| f.expect("every miss was answered above")).collect())
     }
 
     /// Remove the value at a 32-byte vault **address**. Blocks zeroed on both mirrors immediately; the plow reaps the slots.
@@ -1685,6 +1765,146 @@ mod tests {
         assert_eq!(store.read("k").unwrap().as_deref(), Some(&b"in the clear"[..]));
         store.delete("k").unwrap();
         assert!(store.read("k").unwrap().is_none());
+    }
+
+    /// A test address from a counter: its BLAKE3, never a decimal string key.
+    fn addr_of(n: u64) -> [u8; 32] {
+        *blake3::hash(&n.to_le_bytes()).as_bytes()
+    }
+
+    /// A value of its own for each address, a few hundred bytes as a message row is.
+    fn value_of(addr: &[u8; 32]) -> Vec<u8> {
+        let len = (1 << 8) + addr[0] as usize;
+        addr.iter().cycle().take(len).copied().collect()
+    }
+
+    /// What a loop of read_addr answers, for comparing a batch against.
+    fn read_loop(store: &FlatStorage, addrs: &[[u8; 32]]) -> Vec<Option<Vec<u8>>> {
+        addrs.iter().map(|a| store.read_addr(a).unwrap()).collect()
+    }
+
+    /// read_addr_batch is a loop of read_addr: present, absent, mixed, repeated and empty lists, cold from disk (a fresh open, nothing cached) and again warm from the read cache, sealed and plaintext.
+    #[test]
+    fn read_addr_batch_equals_a_loop_of_read_addr() {
+        isolate();
+        let present: Vec<[u8; 32]> = (0..1 << 6).map(addr_of).collect();
+        let absent: Vec<[u8; 32]> = ((1 << 6)..(1 << 7)).map(addr_of).collect();
+        let deleted = addr_of(1 << 8);
+        // Mixed: present and absent interleaved, a deleted one, and an address asked twice.
+        let mut mixed: Vec<[u8; 32]> = present.iter().zip(&absent).flat_map(|(p, a)| [*p, *a]).collect();
+        mixed.push(deleted);
+        mixed.push(*present.last().unwrap());
+        for (seed, plaintext) in [([0x5Au8; 32], false), ([0x5Bu8; 32], true)] {
+            let secret = [0x5Cu8; 32];
+            let open = || if plaintext { FlatStorage::new_plaintext(APP, seed, secret) } else { FlatStorage::new(APP, seed, secret) };
+            {
+                let store = open().unwrap();
+                let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = present.iter().map(|a| (*a, Some(value_of(a)))).collect();
+                items.push((deleted, Some(b"gone soon".to_vec())));
+                store.apply_addr_batch(items).unwrap();
+                store.delete_addr(&deleted).unwrap();
+            }
+            let store = open().unwrap();
+            for list in [&present[..], &absent[..], &mixed[..], &[][..]] {
+                // Cold first: the batch goes through the librarian's GetMany; the loop after it is then served from what the batch cached.
+                let batch = store.read_addr_batch(list).unwrap();
+                assert_eq!(batch.len(), list.len());
+                assert_eq!(batch, read_loop(&store, list));
+                for (a, got) in list.iter().zip(&batch) {
+                    let want = present.contains(a).then(|| value_of(a));
+                    assert_eq!(got, &want, "the batch answers each address with its own value or None");
+                }
+                // Warm: every address now in the read cache, the batch answers without the librarian and still matches.
+                assert_eq!(store.read_addr_batch(list).unwrap(), batch);
+            }
+            // A batch read after a write in the same session sees the write (read-your-own-writes, as read_addr).
+            store.write_addr(&absent[0], b"written late").unwrap();
+            assert_eq!(store.read_addr_batch(&absent[..2]).unwrap(), vec![Some(b"written late".to_vec()), None]);
+        }
+    }
+
+    /// A batch errs where read_addr errs: a value that does not open under this vault's key (here a device-scope value read as an identity one) fails the batch, as it fails the read.
+    #[test]
+    fn read_addr_batch_errs_as_read_addr_does() {
+        isolate();
+        let store = FlatStorage::new(APP, [0x5Du8; 32], [0x5Eu8; 32]).unwrap();
+        store.write_device("device thing", b"sealed under the device key").unwrap();
+        let wrong = store.derive_device_entry_key("device thing");
+        let fine = addr_of(1 << 9);
+        store.write_addr(&fine, b"fine").unwrap();
+        assert!(store.read_addr(&wrong).is_err());
+        assert!(store.read_addr_batch(&[fine, wrong]).is_err());
+        assert_eq!(store.read_addr_batch(&[fine]).unwrap(), vec![Some(b"fine".to_vec())]);
+    }
+
+    /// THE MEASUREMENT (2026-11-20): Photon's launch read 2340 message rows one read_addr each, ~0.2 ms a read on a desktop.
+    /// A vault of 2340 rows of a few hundred bytes, written a page at a time beside a catalog value rewritten each page, then read cold (a fresh open, the read cache empty, as at launch) by a loop of read_addr and by read_addr_batch in pages of 128, each on a settled walk and on one still walking.
+    /// Run: `TMPDIR=<a dir on the build disk> cargo test --release -- --ignored --nocapture read_batch_timing`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn read_batch_timing() {
+        isolate();
+        // Photon's row count at launch on the desktop, 2026-11-20 (a measured figure, not a knob).
+        const ROWS: u64 = 2340;
+        const PAGE: usize = 1 << 7;
+        let (seed, secret) = ([0x6Au8; 32], [0x6Bu8; 32]);
+        let addrs: Vec<[u8; 32]> = (0..ROWS).map(addr_of).collect();
+        let catalog = addr_of(u64::MAX);
+        {
+            let store = FlatStorage::new(APP, seed, secret).unwrap();
+            let t = std::time::Instant::now();
+            for page in addrs.chunks(1 << 4) {
+                let mut items: Vec<([u8; 32], Option<Vec<u8>>)> = page.iter().map(|a| (*a, Some(value_of(a)))).collect();
+                items.push((catalog, Some(page.concat())));
+                store.apply_addr_batch(items).unwrap();
+            }
+            eprintln!("built {} rows in {} ms", ROWS, t.elapsed().as_millis());
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        // One cold read of every row: a fresh open (the read cache empty, as at launch), its walk finished first or left to run, then the rows by a loop of read_addr or by pages.
+        let cold = |settled: bool, batch: bool| {
+            let store = FlatStorage::new(APP, seed, secret).unwrap();
+            if settled {
+                store.vault_stats().unwrap();
+            }
+            let t = std::time::Instant::now();
+            let rows: Vec<Option<Vec<u8>>> = if batch {
+                addrs.chunks(PAGE).flat_map(|page| store.read_addr_batch(page).unwrap()).collect()
+            } else {
+                read_loop(&store, &addrs)
+            };
+            (ms(t.elapsed()), rows)
+        };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() >> 1]
+        };
+        for settled in [true, false] {
+            let (mut ones, mut manys) = (Vec::new(), Vec::new());
+            // Each round alternates which goes first, so neither always meets the device's state the other left.
+            for round in 0..1 << 3 {
+                let first_batch = round & 1 == 1;
+                let (a, rows_a) = cold(settled, first_batch);
+                let (b, rows_b) = cold(settled, !first_batch);
+                assert_eq!(rows_a, rows_b);
+                let (one, many) = if first_batch { (b, a) } else { (a, b) };
+                eprintln!("walk {} round {round}: read_addr {one:.1} ms, read_addr_batch {many:.1} ms", if settled { "settled" } else { "running" });
+                ones.push(one);
+                manys.push(many);
+            }
+            let (one, many) = (median(ones), median(manys));
+            eprintln!(
+                "walk {}, median of {}: {} read_addr {:.1} ms ({:.1} us each); read_addr_batch in pages of {PAGE} {:.1} ms ({:.1} us a row); {:.2}x",
+                if settled { "settled" } else { "running" },
+                1 << 3,
+                ROWS,
+                one,
+                one * 1e3 / ROWS as f64,
+                many,
+                many * 1e3 / ROWS as f64,
+                one / many
+            );
+        }
     }
 }
 
