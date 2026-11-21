@@ -97,7 +97,7 @@ One nested `entry` section per address answered, in request order. Each carries:
 - A reply is at most the caller's buffer, at most 1 MiB: the vault process's reply buffer today (`out`, `STORE_GET_MAX` and 4 KiB).
 - The vault answers the addresses in order while each entry fits in what is left. The first entry that does not fit ends the reply, unless it is the first: then it is answered with state 2, so every reply answers at least one address.
 - The answered entries are always a prefix of the request. The caller asks again with the addresses from the first one not answered. The vault keeps nothing between calls (unlike the export, which holds its document): there is nothing to wipe at a lock, and a caller that stops asking leaves nothing behind.
-- A page of Photon's rows (128 of a few hundred bytes, sealed twice) is about 64 KiB: one call.
+- A page of Photon's rows (128 of a few hundred bytes, each with kete's 40 bytes of nonce and tag) is about 64 KiB: one call.
 
 ### What it saves on ferros
 
