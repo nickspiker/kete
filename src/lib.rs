@@ -504,11 +504,46 @@ pub struct FlatStorage {
     repaired_lost_values: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Whether values are encrypted (per-key ChaCha20-Poly1305) before storage. False = plaintext: the vault still gives integrity + durability (manifestus BLAKE3-seals every block), values are just stored as-is and stay inspectable on disk (e.g. `vsfinfo` on a VSF value). The caller's choice — a plaintext vault is not leaked-file-safe.
     encrypt: bool,
+    /// Set once by [`retire`](Self::retire): every later call errs here instead of reaching a librarian or a ring that is gone.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for FlatStorage {
     /// Close synchronously: hand the librarian a dead mailbox so it leaves its loop, then wait for it, so the ring files are closed and their lock is free the moment this handle is gone.
     fn drop(&mut self) {
+        self.close_librarian();
+    }
+}
+
+/// The engines `open_shared` hands out, by vault filename. `Weak`, so a vault every holder dropped closes normally and a later open builds it fresh.
+static OPEN_VAULTS: Mutex<Vec<(String, Weak<FlatStorage>)>> = Mutex::new(Vec::new());
+
+/// The engines `open_device_shared` hands out, by vault filename; the same rule as [`OPEN_VAULTS`].
+static OPEN_DEVICE_VAULTS: Mutex<Vec<(String, Weak<FlatStorage>)>> = Mutex::new(Vec::new());
+
+impl FlatStorage {
+    /// Post one op to the librarian and wait for its reply — the shared shape of every sync wrapper. A dead librarian (all-senders-dropped teardown racing a call, or a panicked thread) surfaces as a Vault error, the same failure class the old poisoned mutex produced, minus the poisoning.
+    fn post<R>(&self, op: VaultOp, reply_rx: std::sync::mpsc::Receiver<R>) -> Result<R, StorageError> {
+        self.send_op(op)?;
+        reply_rx
+            .recv()
+            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))
+    }
+
+    /// Hand one op to the librarian; a retired vault refuses here, before any mailbox.
+    fn send_op(&self, op: VaultOp) -> Result<(), StorageError> {
+        if self.is_retired() {
+            return Err(StorageError::Vault("vault retired: this device's vault was discarded, and this handle serves nothing".to_string()));
+        }
+        self.ops
+            .lock()
+            .map_err(|_| StorageError::Vault("vault mailbox lock poisoned".to_string()))?
+            .send(op)
+            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))
+    }
+
+    /// Swap in a dead mailbox so the librarian leaves its loop once the ops already queued are answered, then wait for it: the ring files are closed and their lock free when this returns.
+    fn close_librarian(&self) {
         let (dead, _) = std::sync::mpsc::channel();
         if let Ok(mut ops) = self.ops.lock() {
             drop(std::mem::replace(&mut *ops, dead));
@@ -518,19 +553,29 @@ impl Drop for FlatStorage {
             let _ = h.join();
         }
     }
-}
 
-impl FlatStorage {
-    /// Post one op to the librarian and wait for its reply — the shared shape of every sync wrapper. A dead librarian (all-senders-dropped teardown racing a call, or a panicked thread) surfaces as a Vault error, the same failure class the old poisoned mutex produced, minus the poisoning.
-    fn post<R>(&self, op: VaultOp, reply_rx: std::sync::mpsc::Receiver<R>) -> Result<R, StorageError> {
-        self.ops
-            .lock()
-            .map_err(|_| StorageError::Vault("vault mailbox lock poisoned".to_string()))?
-            .send(op)
-            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| StorageError::Vault("vault thread gone".to_string()))
+    /// Retire this engine for good, before its files are discarded ([`discard_device_vault`]): every holder of this `Arc` errs from here on instead of reading a dead vault's values or writing into files that are gone.
+    /// The librarian closes as at drop, the identity is forgotten, the read cache is emptied and stays shut, and the engine leaves the shared registries, so the next open of the same file builds a fresh engine that serves whichever identity attests next.
+    /// Idempotent. A wipe or a release that keeps the process alive calls this; an exit right after the discard does not need to.
+    pub fn retire(&self) {
+        self.retired.store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut c) = self.read_cache.lock() {
+            c.shut();
+        }
+        if let Ok(mut g) = self.identity.lock() {
+            *g = None;
+        }
+        for reg in [&OPEN_VAULTS, &OPEN_DEVICE_VAULTS] {
+            if let Ok(mut r) = reg.lock() {
+                r.retain(|(_, w)| !std::ptr::eq(w.as_ptr(), self));
+            }
+        }
+        self.close_librarian();
+    }
+
+    /// Whether [`retire`](Self::retire) has run on this engine.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -553,8 +598,6 @@ impl FlatStorage {
     ///
     /// The registry holds `Weak` refs: a vault fully dropped by every holder closes normally and a later `open_shared` reopens it fresh.
     pub fn open_shared(app: App, vault_seed: [u8; 32], secret: [u8; 32]) -> Result<Arc<Self>, StorageError> {
-        static OPEN_VAULTS: Mutex<Vec<(String, Weak<FlatStorage>)>> = Mutex::new(Vec::new());
-
         let filename = tohu::vault_path_name(app.id, &vault_seed, &secret);
         let mut reg = OPEN_VAULTS
             .lock()
@@ -574,7 +617,6 @@ impl FlatStorage {
 
     /// Open the ONE device vault — exists from FIRST LAUNCH, named from the device secret alone (tohu::device_vault_path_name), no identity required. Device-scope entries (`*_device` methods) work immediately; identity-scope entries unlock via [`set_identity`](Self::set_identity) at attest. Same process-wide shared-engine registry as [`open_shared`](Self::open_shared).
     pub fn open_device_shared(app: App, device_secret: [u8; 32]) -> Result<Arc<Self>, StorageError> {
-        static OPEN_DEVICE_VAULTS: Mutex<Vec<(String, Weak<FlatStorage>)>> = Mutex::new(Vec::new());
         let filename = tohu::device_vault_path_name(app.id, &device_secret);
         let mut reg = OPEN_DEVICE_VAULTS
             .lock()
@@ -631,6 +673,7 @@ impl FlatStorage {
             healed_at_open: false,
             repaired_lost_values: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             encrypt,
+            retired: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -694,6 +737,7 @@ impl FlatStorage {
             healed_at_open,
             repaired_lost_values: lost,
             encrypt,
+            retired: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -706,14 +750,7 @@ impl FlatStorage {
         addrs: &[[u8; 32]],
         cache: impl FnOnce(&mut ReadCache),
     ) -> Result<(), StorageError> {
-        let sent = self
-            .ops
-            .lock()
-            .map_err(|_| StorageError::Vault("vault mailbox lock poisoned".to_string()))
-            .and_then(|tx| tx.send(op).map_err(|_| StorageError::Vault("vault thread gone".to_string())));
-        if let Err(e) = sent {
-            return Err(e);
-        }
+        self.send_op(op)?;
         if let Ok(mut c) = self.read_cache.lock() {
             cache(&mut c);
         }
@@ -777,6 +814,8 @@ pub(crate) struct ReadCache {
     generation: u64,
     /// The generation of the latest drop or clear.
     purged: u64,
+    /// Set by [`shut`](Self::shut) when the engine retires: every lookup misses and nothing is installed again.
+    closed: bool,
 }
 
 impl ReadCache {
@@ -784,7 +823,7 @@ impl ReadCache {
     const CAP_BYTES: usize = 1 << 26;
 
     fn new() -> Self {
-        Self { entries: Vec::new(), held: 0, generation: 0, purged: 0 }
+        Self { entries: Vec::new(), held: 0, generation: 0, purged: 0, closed: false }
     }
 
     fn generation(&self) -> u64 {
@@ -803,11 +842,17 @@ impl ReadCache {
 
     /// The cached stored bytes at `addr` (`Some(None)` = known absent).
     fn lookup(&self, addr: &[u8; 32]) -> Option<Option<Vec<u8>>> {
+        if self.closed {
+            return None;
+        }
         self.find(addr).ok().map(|i| self.entries[i].stored.clone())
     }
 
     /// A write's value (or absence marker) for `addr`: stamped with a fresh generation, so every fill looked up before it is refused.
     fn put(&mut self, addr: [u8; 32], stored: Option<Vec<u8>>) {
+        if self.closed {
+            return;
+        }
         self.generation += 1;
         let incoming = stored.as_ref().map_or(0, |v| v.len());
         // WHY: a single value past the cap is not cached, else the cap would hold for every value but this one.
@@ -822,6 +867,9 @@ impl ReadCache {
 
     /// The librarian's answer for a miss looked up at generation `posted`: installed only if no write could have outrun it, i.e. the slot carries no later stamp and nothing was removed since the lookup.
     fn fill(&mut self, addr: [u8; 32], stored: Option<Vec<u8>>, posted: u64) {
+        if self.closed {
+            return;
+        }
         if self.purged > posted {
             return;
         }
@@ -881,6 +929,12 @@ impl ReadCache {
         self.purged = self.generation;
         self.entries.clear();
         self.held = 0;
+    }
+
+    /// Empty the cache and keep it empty: a retired engine serves nothing from RAM either.
+    fn shut(&mut self) {
+        self.clear();
+        self.closed = true;
     }
 }
 
@@ -1349,8 +1403,9 @@ pub struct Rehomed {
     pub unopened: usize,
 }
 
-/// Remove both ring files of the device vault founded under `device_secret`: the retired vault after a re-home, deleted as the OS deletes (no shred claim). Absent files are not an error.
-/// The caller sees to it that no engine of this process still serves it, or exits right after. ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01.
+/// Remove both ring files of the device vault founded under `device_secret`, deleted as the OS deletes (no shred claim). Absent files are not an error.
+/// Two callers: a device wipe or release, which outlives the pin below, and the old vault after a re-home (ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01).
+/// The caller first retires every engine of this process that serves the vault ([`FlatStorage::retire`]), or exits right after; an engine left serving it would keep writing into files that are gone.
 #[cfg(not(target_os = "ferros"))]
 pub fn discard_device_vault(app: App, device_secret: &[u8; 32]) -> std::io::Result<()> {
     let filename = tohu::device_vault_path_name(app.id, device_secret);
@@ -1693,6 +1748,64 @@ mod tests {
         v.write_device("contacts", b"device-side").unwrap();
         assert_eq!(v.read("contacts").unwrap().as_deref(), Some(&b"alice"[..]));
         assert_eq!(v.read_device("contacts").unwrap().as_deref(), Some(&b"device-side"[..]));
+    }
+
+    /// A retired engine fails loud: every holder of the old `Arc` errs on read and write, the cached values included, and the identity is gone.
+    #[test]
+    fn retired_vault_errors_on_use() {
+        isolate();
+        let dev = [0x91u8; 32];
+        let v = FlatStorage::open_device_shared(APP, dev).unwrap();
+        v.set_identity([0x92u8; 32]).unwrap();
+        v.write_device("binding", b"bound").unwrap();
+        v.write("contacts", b"alice").unwrap();
+        // Both values sit in the read cache now, so a retire that left the cache serving would show here.
+        assert_eq!(v.read("contacts").unwrap().as_deref(), Some(&b"alice"[..]));
+        let stale = v.clone();
+        v.retire();
+        v.retire();
+        assert!(stale.is_retired());
+        assert_eq!(stale.identity(), None);
+        assert!(stale.read_device("binding").is_err());
+        assert!(stale.read("contacts").is_err());
+        assert!(stale.read_addr_batch(&[stale.entry_addr("contacts")]).is_err());
+        assert!(stale.write_device("binding", b"again").is_err());
+        assert!(stale.write("contacts", b"bob").is_err());
+        assert!(stale.delete_device("binding").is_err());
+        assert!(stale.set_identity([0x92u8; 32]).is_ok(), "set_identity itself is unchanged; the engine behind it still refuses every op");
+        assert!(stale.read("contacts").is_err());
+        discard_device_vault(APP, &dev).unwrap();
+    }
+
+    /// The Android unbind bug in one process: without a retire, the open after a wipe hands back the old engine and refuses the next identity; with retire then discard, the next open is a fresh, empty vault that takes the new identity, and the stale handle still errs.
+    #[test]
+    fn wipe_then_new_identity_opens_in_one_process() {
+        isolate();
+        let dev = [0x93u8; 32];
+        let old = FlatStorage::open_device_shared(APP, dev).unwrap();
+        old.set_identity([0x94u8; 32]).unwrap();
+        old.write_device("binding", b"bound").unwrap();
+        old.write("contacts", b"alice").unwrap();
+        // The bug: the registry serves the live engine, which still carries the old identity.
+        let same = FlatStorage::open_device_shared(APP, dev).unwrap();
+        assert!(Arc::ptr_eq(&old, &same));
+        assert!(same.set_identity([0x95u8; 32]).is_err());
+        drop(same);
+        // The wipe: retire first, then discard the files thru kete.
+        old.retire();
+        discard_device_vault(APP, &dev).unwrap();
+        assert!(!device_vault_present(APP, &dev));
+        let fresh = FlatStorage::open_device_shared(APP, dev).unwrap();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        fresh.set_identity([0x95u8; 32]).unwrap();
+        assert_eq!(fresh.read_device("binding").unwrap(), None);
+        assert_eq!(fresh.read("contacts").unwrap(), None);
+        fresh.write("contacts", b"carol").unwrap();
+        assert_eq!(fresh.read("contacts").unwrap().as_deref(), Some(&b"carol"[..]));
+        assert!(old.read("contacts").is_err());
+        assert!(old.write("contacts", b"x").is_err());
+        drop(fresh);
+        discard_device_vault(APP, &dev).unwrap();
     }
 
     /// A batch of device-scope deletes removes every key it names, leaves the rest, takes absent keys in stride, and holds across a reopen.
